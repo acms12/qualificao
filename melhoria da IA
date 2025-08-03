@@ -1,0 +1,1939 @@
+import os
+import sys
+import logging
+import asyncio
+from typing import Dict, List, Optional, Tuple, Any, Union
+from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+import json
+import pickle
+import warnings
+from contextlib import asynccontextmanager
+import math
+import uuid
+import numpy as np
+import pandas as pd
+from pydantic import BaseModel, Field, validator
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Float, Text, ForeignKey, Boolean, JSON
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session, relationship
+from sqlalchemy.dialects.postgresql import UUID
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.svm import SVC
+from sklearn.metrics import classification_report, accuracy_score, f1_score
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.metrics.pairwise import cosine_similarity
+import joblib
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request, Response, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import uvicorn
+from prometheus_client import Counter, Histogram, Gauge, generate_latest, REGISTRY
+
+# Flags globais para controle de disponibilidade de recursos
+RAG_AVAILABLE = False
+DEEP_LEARNING_AVAILABLE = False
+REDIS_AVAILABLE = False
+
+# Importações condicionais
+try:
+    import faiss
+    import sentence_transformers
+    RAG_AVAILABLE = True
+    logging.info("FAISS e Sentence-Transformers carregados com sucesso.")
+except ImportError:
+    logging.warning("FAISS ou Sentence-Transformers não encontrados. RAG será desabilitado.")
+    logging.info("Para habilitar o RAG, instale: pip install faiss-cpu sentence-transformers")
+
+try:
+    import torch
+    import torch.nn as nn
+    from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline, AutoModel
+    DEEP_LEARNING_AVAILABLE = True
+    logging.info("PyTorch e Transformers carregados com sucesso.")
+except ImportError:
+    logging.warning("PyTorch ou Hugging Face Transformers não encontrados. Modelos de Deep Learning e LLM serão desabilitados.")
+    logging.info("Para habilitar Deep Learning, instale: pip install torch transformers")
+
+try:
+    import redis
+    REDIS_AVAILABLE = True
+    logging.info("Redis carregado com sucesso.")
+except ImportError:
+    logging.warning("Redis não encontrado. Cache será desabilitado.")
+    logging.info("Para habilitar o cache Redis, instale: pip install redis")
+
+# Ignora warnings
+warnings.filterwarnings('ignore')
+
+# Habilita nest_asyncio
+try:
+    import nest_asyncio
+    nest_asyncio.apply()
+except (ImportError, RuntimeError):
+    pass
+
+
+# Métricas Prometheus
+
+def unregister_if_exists(registry, name):
+    """Remove métricas existentes para evitar erros em re-execuções."""
+    for existing_metric_full_name in list(registry._names_to_collectors.keys()):
+        if existing_metric_full_name.startswith(name):
+            try:
+                collector = registry._names_to_collectors[existing_metric_full_name]
+                registry.unregister(collector)
+                logging.debug(f"Métrica desregistrada: {existing_metric_full_name}")
+            except KeyError:
+                pass
+
+metrics_to_unregister = [
+    'vygotea_requests_total', 'vygotea_request_duration_seconds',
+    'vygotea_emotion_predictions_total', 'vygotea_user_progress',
+    'vygotea_intervention_success_total', 'vygotea_gamification_events_total'
+]
+for metric_name in metrics_to_unregister:
+    unregister_if_exists(REGISTRY, metric_name)
+
+REQUEST_COUNT = Counter('vygotea_requests_total', 'Total requests', ['endpoint', 'method'])
+REQUEST_DURATION = Histogram('vygotea_request_duration_seconds', 'Request duration')
+EMOTION_PREDICTIONS = Counter('vygotea_emotion_predictions_total', 'Emotion predictions', ['emotion'])
+USER_PROGRESS = Gauge('vygotea_user_progress', 'User progress score', ['user_id'])
+INTERVENTION_SUCCESS = Counter('vygotea_intervention_success_total', 'Successful interventions', ['type'])
+GAMIFICATION_EVENTS = Counter('vygotea_gamification_events_total', 'Gamification events', ['event_type'])
+
+
+# Configuração
+
+class Config:
+    """Gerenciamento centralizado de configurações para o serviço Vygotea."""
+    DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///vygotea.db")
+    REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+    MODEL_PATH = os.getenv("MODEL_PATH", "./models")
+    RETRAIN_INTERVAL_HOURS = int(os.getenv("RETRAIN_INTERVAL_HOURS", "24"))
+    SECRET_KEY = os.getenv("SECRET_KEY", "vygotea-secret-key-prod")
+    CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
+    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+    MIN_TRAINING_SAMPLES = int(os.getenv("MIN_TRAINING_SAMPLES", "100"))
+    MODEL_CONFIDENCE_THRESHOLD = float(os.getenv("MODEL_CONFIDENCE_THRESHOLD", "0.7"))
+    RAG_KNOWLEDGE_PATH = os.getenv("RAG_KNOWLEDGE_PATH", "./knowledge_base")
+    RAG_INDEX_PATH = os.getenv("RAG_INDEX_PATH", "./rag_index")
+    GAMIFICATION_ENABLED = os.getenv("GAMIFICATION_ENABLED", "true").lower() == "true"
+    XP_PER_INTERACTION = int(os.getenv("XP_PER_INTERACTION", "10"))
+    ALPHA_ADAPTATION = float(os.getenv("ALPHA_ADAPTATION", "0.3"))
+    BETA_EMOTIONAL_REG = float(os.getenv("BETA_EMOTIONAL_REG", "0.3"))
+    BETA_SOCIAL_SKILLS = float(os.getenv("BETA_SOCIAL_SKILLS", "0.3"))
+    BETA_PEDAGOGICAL_AUTO = float(os.getenv("BETA_PEDAGOGICAL_AUTO", "0.25"))
+    BETA_EMOTIONAL_COMP = float(os.getenv("BETA_EMOTIONAL_COMP", "0.15"))
+    LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gpt2")
+
+
+# Enums
+
+class EmotionType(str, Enum):
+    ANSIEDADE = "ansiedade"
+    TRISTEZA = "tristeza"
+    RAIVA = "raiva"
+    MEDO = "medo"
+    ALEGRIA = "alegria"
+    CALMA = "calma"
+    NEUTRO = "neutro"
+
+class BehaviorType(str, Enum):
+    AUTOCONTROLE_POSITIVO = "autocontrole_positivo"
+    COMUNICACAO_ASSERTIVA = "comunicacao_assertiva"
+    ENFRENTAMENTO_ADAPTATIVO = "enfrentamento_adaptativo"
+    COMPORTAMENTO_PROBLEMA = "comportamento_problema"
+    ISOLAMENTO_SOCIAL = "isolamento_social"
+
+class IntensityLevel(str, Enum):
+    BAIXA = "baixa"
+    MEDIA = "media"
+    ALTA = "alta"
+
+class InterventionType(str, Enum):
+    COGNITIVE_REFRAMING = "cognitive_reframing"
+    BEHAVIORAL_ACTIVATION = "behavioral_activation"
+    MINDFULNESS = "mindfulness"
+    SOCIAL_SKILLS = "social_skills"
+    EMOTIONAL_REGULATION = "emotional_regulation"
+    ABA_REINFORCEMENT = "aba_reinforcement"
+    ABA_SKILL_BUILDING = "aba_skill_building"
+    GENERAL_SUPPORT = "general_support"
+
+class GamificationEventType(str, Enum):
+    XP_GAINED = "xp_gained"
+    LEVEL_UP = "level_up"
+    BADGE_EARNED = "badge_earned"
+    STREAK_MILESTONE = "streak_milestone"
+    CHALLENGE_COMPLETED = "challenge_completed"
+
+class BadgeType(str, Enum):
+    EMOTIONAL_MASTER = "emotional_master"
+    SOCIAL_BUTTERFLY = "social_butterfly"
+    MINDFUL_WARRIOR = "mindful_warrior"
+    CONSISTENCY_CHAMPION = "consistency_champion"
+    PROGRESS_PIONEER = "progress_pioneer"
+    FIRST_INTERACTION = "first_interaction"
+
+
+# Modelos Pydantic
+
+class UserInput(BaseModel):
+    user_id: str = Field(..., description="Unique user identifier")
+    message: str = Field(..., min_length=1, max_length=5000)
+    session_id: Optional[str] = Field(None)
+    context: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    feedback_score: Optional[int] = Field(None, ge=1, le=5)
+
+    @validator('message')
+    def validate_message(cls, v):
+        if not v.strip():
+            raise ValueError("Message cannot be empty")
+        return v.strip()
+
+class AdaptiveProgressMetrics(BaseModel):
+    emotional_regulation: float = Field(..., ge=0, le=1)
+    social_skills: float = Field(..., ge=0, le=1)
+    pedagogical_autonomy: float = Field(..., ge=0, le=1)
+    emotional_comprehension: float = Field(..., ge=0, le=1)
+    overall_progress: float = Field(..., ge=0, le=1)
+
+class GamificationEvent(BaseModel):
+    event_type: GamificationEventType
+    points_earned: int
+    description: str
+    timestamp: datetime
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+class UserGamificationProfile(BaseModel):
+    user_id: str
+    level: int = 1
+    total_xp: int = 0
+    current_streak: int = 0
+    longest_streak: int = 0
+    badges: List[BadgeType] = Field(default_factory=list)
+    recent_events: List[GamificationEvent] = Field(default_factory=list)
+
+class MLAnalysisResult(BaseModel):
+    emotion: EmotionType
+    emotion_confidence: float = Field(..., ge=0, le=1)
+    behavior: BehaviorType
+    behavior_confidence: float = Field(..., ge=0, le=1)
+    intensity: IntensityLevel
+    method: str
+    processing_time_ms: float
+    model_version: str
+    rag_context_used: bool = False
+    additional_insights: Dict[str, Any] = Field(default_factory=dict)
+
+class ZDPAssessment(BaseModel):
+    user_id: str
+    current_level: Dict[str, float]
+    proximal_zone: Dict[str, Any]
+    development_potential: Dict[str, Any]
+    recommendations: List[str]
+    support_level: str
+    confidence: float
+    adaptive_progress: AdaptiveProgressMetrics
+
+class InterventionResponse(BaseModel):
+    response_text: str
+    intervention_type: str
+    zdp_assessment: Optional[ZDPAssessment] = None
+    ml_analysis: MLAnalysisResult
+    suggested_activities: List[str] = Field(default_factory=list)
+    progress_indicators: Dict[str, Any] = Field(default_factory=dict)
+    gamification_events: List[GamificationEvent] = Field(default_factory=list)
+    adaptive_progress: AdaptiveProgressMetrics
+
+class QualityIndicators(BaseModel):
+    average_duration: float
+    satisfaction_score: float
+    average_progress: float
+    progress_satisfaction_correlation: float
+    total_interactions: int
+
+class FeedbackData(BaseModel):
+    interaction_id: str
+    user_id: str
+    feedback_score: int = Field(..., ge=1, le=5)
+    feedback_text: Optional[str] = None
+    improvement_suggestions: Optional[List[str]] = Field(default_factory=list)
+
+# ---
+## Modelos de Banco de Dados (SQLAlchemy)
+
+Base = declarative_base()
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String, unique=True, nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    profile_data = Column(Text)
+    is_active = Column(Boolean, default=True)
+    level = Column(Integer, default=1)
+    total_xp = Column(Integer, default=0)
+    current_streak = Column(Integer, default=0)
+    longest_streak = Column(Integer, default=0)
+    badges = Column(JSON, default=list)
+    last_interaction = Column(DateTime, default=datetime.utcnow)
+    recent_events = Column(JSON, default=list)
+
+    interactions = relationship("Interaction", back_populates="user")
+    assessments = relationship("Assessment", back_populates="user")
+    progress_records = relationship("ProgressRecord", back_populates="user")
+
+class Interaction(Base):
+    __tablename__ = "interactions"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    session_id = Column(String, nullable=True)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    user_message = Column(Text, nullable=False)
+    context_data = Column(Text)
+    detected_emotion = Column(String, nullable=False)
+    emotion_confidence = Column(Float, nullable=False)
+    detected_behavior = Column(String, nullable=False)
+    behavior_confidence = Column(Float, nullable=False)
+    intensity_level = Column(String, nullable=False)
+    bot_response = Column(Text, nullable=False)
+    intervention_type = Column(String, nullable=False)
+    processing_time_ms = Column(Float)
+    feedback_score = Column(Integer, nullable=True)
+    rag_context_used = Column(Boolean, default=False)
+    rag_sources = Column(JSON, default=list)
+    interaction_duration = Column(Float, nullable=True)
+    user_satisfaction = Column(Float, nullable=True)
+    
+    user = relationship("User", back_populates="interactions")
+
+class ProgressRecord(Base):
+    __tablename__ = "progress_records"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    emotional_regulation = Column(Float, nullable=False)
+    social_skills = Column(Float, nullable=False)
+    pedagogical_autonomy = Column(Float, nullable=False)
+    emotional_comprehension = Column(Float, nullable=False)
+    overall_progress = Column(Float, nullable=False)
+    previous_progress = Column(Float, nullable=True)
+    interaction_id = Column(String, ForeignKey("interactions.id"))
+    
+    user = relationship("User", back_populates="progress_records")
+
+class Assessment(Base):
+    __tablename__ = "assessments"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    domain = Column(String, nullable=False)
+    current_level_score = Column(Float, nullable=False)
+    proximal_zone_lower = Column(Float, nullable=False)
+    proximal_zone_upper = Column(Float, nullable=False)
+    development_potential = Column(Float, nullable=False)
+    assessment_data = Column(Text)
+    
+    user = relationship("User", back_populates="assessments")
+
+class TrainingData(Base):
+    __tablename__ = "training_data"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    text = Column(Text, nullable=False)
+    emotion_label = Column(String, nullable=False)
+    behavior_label = Column(String, nullable=False)
+    intensity_label = Column(String, nullable=False)
+    source = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    is_validated = Column(String, default="pending")
+    validation_score = Column(Float, nullable=True)
+
+class KnowledgeBase(Base):
+    __tablename__ = "knowledge_base"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    title = Column(String, nullable=False)
+    content = Column(Text, nullable=False)
+    category = Column(String, nullable=False)
+    tags = Column(JSON, default=list)
+    embedding_vector = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class FeedbackRecord(Base):
+    __tablename__ = "feedback_records"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    interaction_id = Column(String, ForeignKey("interactions.id"), nullable=False)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    feedback_score = Column(Integer, nullable=False)
+    feedback_text = Column(Text)
+    improvement_suggestions = Column(JSON, default=list)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    processed = Column(Boolean, default=False)
+
+
+# Serviço de Banco de Dados
+
+class DatabaseService:
+    def __init__(self, config: Config):
+        self.config = config
+        self.engine = create_engine(config.DATABASE_URL, echo=False)
+        self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
+        self.logger = logging.getLogger(__name__)
+        self._create_tables()
+
+    def _create_tables(self):
+        """Cria as tabelas do banco de dados se não existirem."""
+        try:
+            Base.metadata.create_all(bind=self.engine)
+            self.logger.info("Tabelas do banco de dados criadas com sucesso.")
+        except Exception as e:
+            self.logger.error(f"Erro ao criar tabelas do banco de dados: {e}", exc_info=True)
+
+    def get_db(self) -> Session:
+        """Obtém uma sessão de banco de dados."""
+        return self.SessionLocal()
+
+    async def get_user_or_create(self, user_id: str) -> User:
+        """Obtém um usuário existente ou o cria se não existir."""
+        db = self.get_db()
+        try:
+            user = db.query(User).filter(User.user_id == user_id).first()
+            if not user:
+                user = User(user_id=user_id)
+                db.add(user)
+                db.commit()
+                db.refresh(user)
+                self.logger.info(f"Novo usuário criado: {user_id}")
+            return user
+        except Exception as e:
+            self.logger.error(f"Erro ao obter ou criar usuário {user_id}: {e}", exc_info=True)
+            raise
+        finally:
+            db.close()
+
+    async def update_user(self, user: User) -> User:
+        """Atualiza um usuário existente no banco de dados."""
+        db = self.get_db()
+        try:
+            db.merge(user)
+            db.commit()
+            db.refresh(user)
+            self.logger.debug(f"Usuário {user.user_id} atualizado.")
+            return user
+        except Exception as e:
+            self.logger.error(f"Erro ao atualizar usuário {user.user_id}: {e}", exc_info=True)
+            raise
+        finally:
+            db.close()
+
+    async def save_interaction(self, interaction_data: Dict) -> str:
+        """Salva uma interação no banco de dados."""
+        db = self.get_db()
+        try:
+            interaction = Interaction(**interaction_data)
+            db.add(interaction)
+            db.commit()
+            db.refresh(interaction)
+            self.logger.debug(f"Interação {interaction.id} salva para o usuário {interaction.user_id}.")
+            return interaction.id
+        except Exception as e:
+            self.logger.error(f"Erro ao salvar interação: {e}", exc_info=True)
+            raise
+        finally:
+            db.close()
+
+    async def save_progress_record(self, progress_data: Dict) -> str:
+        """Salva um registro de progresso adaptativo."""
+        db = self.get_db()
+        try:
+            progress = ProgressRecord(**progress_data)
+            db.add(progress)
+            db.commit()
+            db.refresh(progress)
+            self.logger.debug(f"Registro de progresso {progress.id} salvo.")
+            return progress.id
+        except Exception as e:
+            self.logger.error(f"Erro ao salvar registro de progresso: {e}", exc_info=True)
+            raise
+        finally:
+            db.close()
+
+    async def get_user_history(self, user_id: str, limit: int = 10) -> List[Dict]:
+        """Obtém o histórico de interações recentes do usuário."""
+        db = self.get_db()
+        try:
+            user = db.query(User).filter(User.user_id == user_id).first()
+            if not user:
+                return []
+
+            interactions = db.query(Interaction)\
+                .filter(Interaction.user_id == user.id)\
+                .order_by(Interaction.timestamp.desc())\
+                .limit(limit).all()
+
+            return [{
+                'id': i.id,
+                'timestamp': i.timestamp.isoformat(),
+                'user_message': i.user_message,
+                'detected_emotion': i.detected_emotion,
+                'emotion_confidence': i.emotion_confidence,
+                'detected_behavior': i.detected_behavior,
+                'behavior_confidence': i.behavior_confidence,
+                'bot_response': i.bot_response,
+                'intervention_type': i.intervention_type,
+                'feedback_score': i.feedback_score,
+                'overall_progress': (db.query(ProgressRecord.overall_progress)
+                                       .filter(ProgressRecord.interaction_id == i.id)
+                                       .scalar())
+            } for i in interactions]
+        except Exception as e:
+            self.logger.error(f"Erro ao obter histórico para usuário {user_id}: {e}", exc_info=True)
+            return []
+        finally:
+            db.close()
+
+    async def get_user_progress_history(self, user_id: str, limit: int = 20) -> List[Dict]:
+        """Obtém o histórico de progresso adaptativo do usuário."""
+        db = self.get_db()
+        try:
+            user = db.query(User).filter(User.user_id == user_id).first()
+            if not user:
+                return []
+
+            progress_records = db.query(ProgressRecord)\
+                .filter(ProgressRecord.user_id == user.id)\
+                .order_by(ProgressRecord.timestamp.desc())\
+                .limit(limit).all()
+
+            return [{
+                'timestamp': record.timestamp.isoformat(),
+                'emotional_regulation': record.emotional_regulation,
+                'social_skills': record.social_skills,
+                'pedagogical_autonomy': record.pedagogical_autonomy,
+                'emotional_comprehension': record.emotional_comprehension,
+                'overall_progress': record.overall_progress
+            } for record in progress_records]
+        except Exception as e:
+            self.logger.error(f"Erro ao obter histórico de progresso para usuário {user_id}: {e}", exc_info=True)
+            return []
+        finally:
+            db.close()
+
+    async def save_feedback(self, feedback_data: FeedbackData) -> str:
+        """Salva o feedback do usuário."""
+        db = self.get_db()
+        try:
+            feedback = FeedbackRecord(
+                interaction_id=feedback_data.interaction_id,
+                user_id=feedback_data.user_id,
+                feedback_score=feedback_data.feedback_score,
+                feedback_text=feedback_data.feedback_text,
+                improvement_suggestions=feedback_data.improvement_suggestions
+            )
+            db.add(feedback)
+            db.commit()
+            db.refresh(feedback)
+            self.logger.info(f"Feedback {feedback.id} salvo.")
+            return feedback.id
+        except Exception as e:
+            self.logger.error(f"Erro ao salvar feedback: {e}", exc_info=True)
+            raise
+        finally:
+            db.close()
+
+    async def add_training_data(self, text: str, emotion_label: str, behavior_label: str,
+                                 intensity_label: str, source: str = "real_user", is_validated: str = "pending") -> str:
+        """Adiciona novos dados de treinamento."""
+        db = self.get_db()
+        try:
+            training_data = TrainingData(
+                text=text,
+                emotion_label=emotion_label,
+                behavior_label=behavior_label,
+                intensity_label=intensity_label,
+                source=source,
+                is_validated=is_validated
+            )
+            db.add(training_data)
+            db.commit()
+            db.refresh(training_data)
+            self.logger.debug(f"Dados de treinamento adicionados: {training_data.id}.")
+            return training_data.id
+        except Exception as e:
+            self.logger.error(f"Erro ao adicionar dados de treinamento: {e}", exc_info=True)
+            raise
+        finally:
+            db.close()
+
+    async def get_training_data(self, limit: Optional[int] = None, validated_only: bool = False) -> List[Dict]:
+        """Obtém dados de treinamento."""
+        db = self.get_db()
+        try:
+            query = db.query(TrainingData)
+            if validated_only:
+                query = query.filter(TrainingData.is_validated == "validated")
+            if limit:
+                query = query.limit(limit)
+
+            training_data = query.all()
+            return [{
+                'text': td.text,
+                'emotion_label': td.emotion_label,
+                'behavior_label': td.behavior_label,
+                'intensity_label': td.intensity_label,
+                'source': td.source,
+                'is_validated': td.is_validated,
+                'validation_score': td.validation_score
+            } for td in training_data]
+        except Exception as e:
+            self.logger.error(f"Erro ao obter dados de treinamento: {e}", exc_info=True)
+            return []
+        finally:
+            db.close()
+
+    async def validate_training_data(self, data_id: str, validation_status: str, score: float = None) -> bool:
+        """Valida dados de treinamento."""
+        db = self.get_db()
+        try:
+            data = db.query(TrainingData).filter(TrainingData.id == data_id).first()
+            if data:
+                data.is_validated = validation_status
+                if score is not None:
+                    data.validation_score = score
+                db.commit()
+                self.logger.info(f"Dados de treinamento {data_id} validados como '{validation_status}'.")
+                return True
+            self.logger.warning(f"Dados de treinamento {data_id} não encontrados.")
+            return False
+        except Exception as e:
+            self.logger.error(f"Erro ao validar dados de treinamento {data_id}: {e}", exc_info=True)
+            raise
+        finally:
+            db.close()
+
+    async def add_knowledge_item(self, title: str, content: str, category: str, tags: List[str], embedding: List[float]) -> str:
+        """Adiciona um novo item à base de conhecimento."""
+        db = self.get_db()
+        try:
+            kb_item = KnowledgeBase(
+                title=title,
+                content=content,
+                category=category,
+                tags=tags,
+                embedding_vector=embedding
+            )
+            db.add(kb_item)
+            db.commit()
+            db.refresh(kb_item)
+            self.logger.info(f"Item de conhecimento '{title}' adicionado: {kb_item.id}.")
+            return kb_item.id
+        except Exception as e:
+            self.logger.error(f"Erro ao adicionar item de conhecimento '{title}': {e}", exc_info=True)
+            raise
+        finally:
+            db.close()
+
+    async def get_all_knowledge_items(self) -> List[Dict]:
+        """Obtém todos os itens da base de conhecimento."""
+        db = self.get_db()
+        try:
+            items = db.query(KnowledgeBase).all()
+            return [{
+                'id': item.id,
+                'title': item.title,
+                'content': item.content,
+                'category': item.category,
+                'tags': item.tags,
+                'embedding_vector': item.embedding_vector
+            } for item in items]
+        except Exception as e:
+            self.logger.error(f"Erro ao obter itens da base de conhecimento: {e}", exc_info=True)
+            return []
+        finally:
+            db.close()
+
+
+# Motor RAG (Retrieval-Augmented Generation)
+
+class RAGEngine:
+    def __init__(self, config: Config, db_service: DatabaseService):
+        self.config = config
+        self.db_service = db_service
+        self.logger = logging.getLogger(__name__)
+        self.knowledge_index = None
+        self.sentence_transformer = None
+        self.vector_dim = None
+        self.index_metadata = {"documents": []}
+
+        if RAG_AVAILABLE:
+            self.initialize_rag_components()
+
+    def initialize_rag_components(self):
+        """Inicializa os componentes do RAG."""
+        global RAG_AVAILABLE
+
+        if not RAG_AVAILABLE:
+            self.logger.info("RAG globalmente desabilitado. Pulando inicialização.")
+            return
+
+        try:
+            self.logger.info("Carregando modelo Sentence Transformer...")
+            self.sentence_transformer = sentence_transformers.SentenceTransformer(
+                'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2'
+            )
+            self.vector_dim = self.sentence_transformer.get_sentence_embedding_dimension()
+            self.logger.info(f"Sentence Transformer carregado. Dimensão: {self.vector_dim}")
+
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            
+            loop.run_until_complete(self._load_or_create_index_async())
+            self.logger.info("Mecanismo RAG inicializado com sucesso.")
+        except Exception as e:
+            self.logger.critical(f"Falha na inicialização do RAG: {e}", exc_info=True)
+            RAG_AVAILABLE = False
+            self.logger.warning("RAG desabilitado devido a erro crítico.")
+
+    async def _load_or_create_index_async(self):
+        """Carrega ou cria o índice FAISS."""
+        index_path = Path(self.config.RAG_INDEX_PATH)
+        index_path.mkdir(parents=True, exist_ok=True)
+        faiss_index_file = index_path / "knowledge.index"
+        metadata_file = index_path / "metadata.json"
+
+        if faiss_index_file.exists() and metadata_file.exists():
+            try:
+                self.knowledge_index = faiss.read_index(str(faiss_index_file))
+                with open(metadata_file, 'r') as f:
+                    self.index_metadata = json.load(f)
+                self.logger.info("Índice RAG carregado do disco.")
+                await self._rebuild_index_from_db()
+            except Exception as e:
+                self.logger.error(f"Erro ao carregar índice: {e}. Recriando.", exc_info=True)
+                await self._create_new_index_from_db_initial_populate()
+        else:
+            self.logger.info("Criando novo índice RAG.")
+            await self._create_new_index_from_db_initial_populate()
+
+    async def _create_new_index_from_db_initial_populate(self):
+        """Cria e popula novo índice FAISS."""
+        global RAG_AVAILABLE
+
+        if not self.sentence_transformer:
+            self.logger.error("Sentence transformer indisponível.")
+            RAG_AVAILABLE = False
+            return
+
+        try:
+            self.knowledge_index = faiss.IndexFlatIP(self.vector_dim)
+            self.index_metadata = {"documents": []}
+
+            db_items = await self.db_service.get_all_knowledge_items()
+            if not db_items:
+                self.logger.info("Base de conhecimento vazia. Populando com dados iniciais.")
+                initial_knowledge = [
+                    {
+                        "title": "Reforço Positivo - ABA",
+                        "content": "O reforço positivo é uma estratégia fundamental da ABA que aumenta a probabilidade de um comportamento ocorrer novamente. Deve ser aplicado imediatamente após o comportamento desejado e ser significativo para o indivíduo. Tipos de reforço incluem: social (elogios, atenção), tangível (brinquedos, comida), atividade (jogos preferidos) e sensorial (estímulos prazerosos).",
+                        "category": "ABA",
+                        "tags": ["reforco", "comportamento", "motivacao"]
+                    },
+                    {
+                        "title": "Zona de Desenvolvimento Proximal - Vygotsky",
+                        "content": "A ZDP representa a diferença entre o que uma pessoa pode fazer sozinha e o que pode fazer com ajuda. É nesta zona que ocorre o aprendizado mais efetivo, com o suporte graduado de um mediador. O conceito enfatiza a importância da interação social no processo de aprendizagem e desenvolvimento cognitivo.",
+                        "category": "Vygotsky",
+                        "tags": ["zdp", "aprendizagem", "mediacao"]
+                    },
+                    {
+                        "title": "Regulação Emocional",
+                        "content": "A regulação emocional envolve reconhecer, compreender e gerenciar as próprias emoções. Técnicas incluem: respiração profunda, mindfulness, reestruturação cognitiva, autocompaixão, identificação de gatilhos emocionais e desenvolvimento de estratégias de enfrentamento adaptativas.",
+                        "category": "Emocional",
+                        "tags": ["emocoes", "regulacao", "mindfulness"]
+                    },
+                    {
+                        "title": "Habilidades Sociais",
+                        "content": "As habilidades sociais são comportamentos aprendidos que facilitam a interação positiva com outros. Incluem comunicação verbal e não-verbal, empatia, resolução de conflitos, cooperação, assertividade e reconhecimento de sinais sociais. São desenvolvidas através de modelagem, prática e feedback.",
+                        "category": "Social",
+                        "tags": ["comunicacao", "empatia", "assertividade"]
+                    },
+                    {
+                        "title": "Mindfulness e Atenção Plena",
+                        "content": "Mindfulness é a prática de estar presente no momento atual, observando pensamentos e sentimentos sem julgamento. Benefícios incluem redução do estresse, melhora da regulação emocional, aumento da concentração e desenvolvimento da autoconsciência. Técnicas incluem meditação, respiração consciente e body scan.",
+                        "category": "Mindfulness",
+                        "tags": ["atencao", "meditacao", "presente"]
+                    }
+                ]
+                for doc in initial_knowledge:
+                    await self.add_knowledge(doc["title"], doc["content"], doc["category"], doc["tags"])
+            else:
+                self.logger.info("Reconstruindo índice a partir do DB.")
+                await self._rebuild_index_from_db()
+
+            self._save_index_to_disk()
+            self.logger.info(f"Índice criado com {len(self.index_metadata['documents'])} documentos.")
+
+        except Exception as e:
+            self.logger.critical(f"Erro crítico na criação do índice: {e}", exc_info=True)
+            RAG_AVAILABLE = False
+
+    async def _rebuild_index_from_db(self):
+        """Reconstrói o índice a partir do banco de dados."""
+        global RAG_AVAILABLE
+
+        if not self.sentence_transformer:
+            self.logger.warning("Sentence transformer indisponível.")
+            RAG_AVAILABLE = False
+            return
+
+        self.knowledge_index = faiss.IndexFlatIP(self.vector_dim)
+        self.index_metadata = {"documents": []}
+
+        db_items = await self.db_service.get_all_knowledge_items()
+
+        for item in db_items:
+            try:
+                embedding_vector = item.get('embedding_vector')
+                if embedding_vector and isinstance(embedding_vector, list) and len(embedding_vector) == self.vector_dim:
+                    content_embedding = np.array(embedding_vector).astype('float32').reshape(1, -1)
+                else:
+                    content_embedding = self.sentence_transformer.encode([item["content"]]).astype('float32')
+
+                faiss.normalize_L2(content_embedding)
+                self.knowledge_index.add(content_embedding)
+                
+                self.index_metadata["documents"].append({
+                    "id": item["id"],
+                    "title": item["title"],
+                    "content": item["content"],
+                    "category": item["category"],
+                    "tags": item["tags"]
+                })
+            except Exception as e:
+                self.logger.error(f"Erro ao processar item {item.get('id', 'unknown')}: {e}", exc_info=True)
+
+    def _save_index_to_disk(self):
+        """Salva o índice FAISS e metadados no disco."""
+        index_path = Path(self.config.RAG_INDEX_PATH)
+        faiss_index_file = index_path / "knowledge.index"
+        metadata_file = index_path / "metadata.json"
+
+        try:
+            faiss.write_index(self.knowledge_index, str(faiss_index_file))
+            with open(metadata_file, 'w') as f:
+                json.dump(self.index_metadata, f)
+            self.logger.info("Índice RAG salvo no disco.")
+        except Exception as e:
+            self.logger.error(f"Erro ao salvar índice: {e}", exc_info=True)
+
+    async def add_knowledge(self, title: str, content: str, category: str, tags: List[str]) -> bool:
+        """Adiciona novo conhecimento ao índice RAG."""
+        if not RAG_AVAILABLE or not self.sentence_transformer:
+            self.logger.warning("RAG indisponível para adicionar conhecimento.")
+            return False
+
+        try:
+            content_embedding = self.sentence_transformer.encode([content]).astype('float32')
+            faiss.normalize_L2(content_embedding)
+
+            kb_id = await self.db_service.add_knowledge_item(
+                title, content, category, tags, content_embedding[0].tolist()
+            )
+
+            self.knowledge_index.add(content_embedding)
+            self.index_metadata["documents"].append({
+                "id": kb_id,
+                "title": title,
+                "content": content,
+                "category": category,
+                "tags": tags
+            })
+
+            self._save_index_to_disk()
+            self.logger.info(f"Conhecimento '{title}' adicionado ao RAG.")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Erro ao adicionar conhecimento '{title}': {e}", exc_info=True)
+            return False
+
+    async def search_knowledge(self, query: str, top_k: int = 3) -> List[Dict]:
+        """Busca conhecimento relevante usando RAG."""
+        if not RAG_AVAILABLE or not self.sentence_transformer or not self.knowledge_index:
+            self.logger.warning("RAG indisponível para busca.")
+            return []
+
+        try:
+            query_embedding = self.sentence_transformer.encode([query]).astype('float32')
+            faiss.normalize_L2(query_embedding)
+
+            scores, indices = self.knowledge_index.search(query_embedding, top_k)
+            
+            results = []
+            for i, (score, idx) in enumerate(zip(scores[0], indices[0])):
+                if idx < len(self.index_metadata["documents"]):
+                    doc = self.index_metadata["documents"][idx]
+                    results.append({
+                        "title": doc["title"],
+                        "content": doc["content"],
+                        "category": doc["category"],
+                        "tags": doc["tags"],
+                        "relevance_score": float(score),
+                        "rank": i + 1
+                    })
+
+            return results
+
+        except Exception as e:
+            self.logger.error(f"Erro na busca RAG: {e}", exc_info=True)
+            return []
+
+
+# Serviço de Machine Learning
+
+class MLService:
+    def __init__(self, config: Config):
+        self.config = config
+        self.logger = logging.getLogger(__name__)
+        self.models = {}
+        self.vectorizers = {}
+        self.label_encoders = {}
+        self.model_version = "1.0.0"
+        
+        self._initialize_models()
+
+    def _initialize_models(self):
+        """Inicializa os modelos de ML."""
+        try:
+            self.models = {
+                'emotion': VotingClassifier([
+                    ('rf', RandomForestClassifier(n_estimators=100, random_state=42)),
+                    ('svm', SVC(probability=True, random_state=42)),
+                    ('nb', MultinomialNB())
+                ]),
+                'behavior': VotingClassifier([
+                    ('rf', RandomForestClassifier(n_estimators=100, random_state=42)),
+                    ('lr', LogisticRegression(random_state=42, max_iter=1000))
+                ]),
+                'intensity': RandomForestClassifier(n_estimators=50, random_state=42)
+            }
+
+            self.vectorizers = {
+                'emotion': TfidfVectorizer(max_features=5000, stop_words=None),
+                'behavior': TfidfVectorizer(max_features=5000, stop_words=None),
+                'intensity': TfidfVectorizer(max_features=3000, stop_words=None)
+            }
+
+            self.label_encoders = {
+                'emotion': LabelEncoder(),
+                'behavior': LabelEncoder(),
+                'intensity': LabelEncoder()
+            }
+
+            self.logger.info("Modelos ML inicializados com sucesso.")
+
+        except Exception as e:
+            self.logger.error(f"Erro ao inicializar modelos ML: {e}", exc_info=True)
+
+    async def train_models(self, training_data: List[Dict]) -> bool:
+        """Treina os modelos com os dados fornecidos."""
+        if len(training_data) < self.config.MIN_TRAINING_SAMPLES:
+            self.logger.warning(f"Dados insuficientes para treinamento: {len(training_data)} < {self.config.MIN_TRAINING_SAMPLES}")
+            return False
+
+        try:
+            texts = [item['text'] for item in training_data]
+            emotion_labels = [item['emotion_label'] for item in training_data]
+            behavior_labels = [item['behavior_label'] for item in training_data]
+            intensity_labels = [item['intensity_label'] for item in training_data]
+
+            tasks = ['emotion', 'behavior', 'intensity']
+            labels_dict = {
+                'emotion': emotion_labels,
+                'behavior': behavior_labels,
+                'intensity': intensity_labels
+            }
+
+            for task in tasks:
+                self.logger.info(f"Treinando modelo para {task}...")
+                
+                X = self.vectorizers[task].fit_transform(texts)
+                
+                y = self.label_encoders[task].fit_transform(labels_dict[task])
+                
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X, y, test_size=0.2, random_state=42, stratify=y
+                )
+                
+                self.models[task].fit(X_train, y_train)
+                
+                y_pred = self.models[task].predict(X_test)
+                accuracy = accuracy_score(y_test, y_pred)
+                f1 = f1_score(y_test, y_pred, average='weighted')
+                
+                self.logger.info(f"{task.capitalize()} - Acurácia: {accuracy:.3f}, F1: {f1:.3f}")
+
+            await self._save_models()
+            self.logger.info("Treinamento concluído com sucesso.")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Erro durante o treinamento: {e}", exc_info=True)
+            return False
+
+    async def _save_models(self):
+        """Salva os modelos treinados."""
+        try:
+            model_path = Path(self.config.MODEL_PATH)
+            model_path.mkdir(parents=True, exist_ok=True)
+            
+            for task in ['emotion', 'behavior', 'intensity']:
+                joblib.dump(self.models[task], model_path / f"{task}_model.pkl")
+                joblib.dump(self.vectorizers[task], model_path / f"{task}_vectorizer.pkl")
+                joblib.dump(self.label_encoders[task], model_path / f"{task}_encoder.pkl")
+            
+            metadata = {
+                'version': self.model_version,
+                'timestamp': datetime.utcnow().isoformat(),
+                'tasks': ['emotion', 'behavior', 'intensity']
+            }
+            
+            with open(model_path / "metadata.json", 'w') as f:
+                json.dump(metadata, f)
+                
+            self.logger.info("Modelos salvos com sucesso.")
+            
+        except Exception as e:
+            self.logger.error(f"Erro ao salvar modelos: {e}", exc_info=True)
+
+    async def load_models(self) -> bool:
+        """Carrega modelos salvos."""
+        try:
+            model_path = Path(self.config.MODEL_PATH)
+            if not model_path.exists():
+                self.logger.info("Nenhum modelo salvo encontrado.")
+                return False
+
+            metadata_file = model_path / "metadata.json"
+            if metadata_file.exists():
+                with open(metadata_file, 'r') as f:
+                    metadata = json.load(f)
+                self.model_version = metadata.get('version', '1.0.0')
+
+            for task in ['emotion', 'behavior', 'intensity']:
+                model_file = model_path / f"{task}_model.pkl"
+                vectorizer_file = model_path / f"{task}_vectorizer.pkl"
+                encoder_file = model_path / f"{task}_encoder.pkl"
+                
+                if all(f.exists() for f in [model_file, vectorizer_file, encoder_file]):
+                    self.models[task] = joblib.load(model_file)
+                    self.vectorizers[task] = joblib.load(vectorizer_file)
+                    self.label_encoders[task] = joblib.load(encoder_file)
+                else:
+                    self.logger.warning(f"Arquivos de modelo para {task} não encontrados.")
+                    return False
+
+            self.logger.info(f"Modelos carregados com sucesso (versão {self.model_version}).")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Erro ao carregar modelos: {e}", exc_info=True)
+            return False
+
+    async def predict(self, text: str) -> MLAnalysisResult:
+        """Faz predições usando os modelos treinados."""
+        start_time = datetime.utcnow()
+        
+        try:
+            predictions = {}
+            confidences = {}
+            
+            for task in ['emotion', 'behavior', 'intensity']:
+                X = self.vectorizers[task].transform([text])
+                
+                pred_encoded = self.models[task].predict(X)[0]
+                pred_label = self.label_encoders[task].inverse_transform([pred_encoded])[0]
+                
+                if hasattr(self.models[task], 'predict_proba'):
+                    proba = self.models[task].predict_proba(X)[0]
+                    confidence = float(np.max(proba))
+                else:
+                    confidence = 0.8
+                
+                predictions[task] = pred_label
+                confidences[task] = confidence
+
+            processing_time = (datetime.utcnow() - start_time).total_seconds() * 1000
+
+            return MLAnalysisResult(
+                emotion=EmotionType(predictions['emotion']),
+                emotion_confidence=confidences['emotion'],
+                behavior=BehaviorType(predictions['behavior']),
+                behavior_confidence=confidences['behavior'],
+                intensity=IntensityLevel(predictions['intensity']),
+                method="ensemble_ml",
+                processing_time_ms=processing_time,
+                model_version=self.model_version,
+                additional_insights={
+                    'text_length': len(text),
+                    'word_count': len(text.split())
+                }
+            )
+
+        except Exception as e:
+            self.logger.error(f"Erro na predição: {e}", exc_info=True)
+            processing_time = (datetime.utcnow() - start_time).total_seconds() * 1000
+            return MLAnalysisResult(
+                emotion=EmotionType.NEUTRO,
+                emotion_confidence=0.5,
+                behavior=BehaviorType.AUTOCONTROLE_POSITIVO,
+                behavior_confidence=0.5,
+                intensity=IntensityLevel.MEDIA,
+                method="fallback",
+                processing_time_ms=processing_time,
+                model_version=self.model_version
+            )
+
+
+# Serviço de Gamificação
+
+class GamificationService:
+    def __init__(self, config: Config):
+        self.config = config
+        self.logger = logging.getLogger(__name__)
+
+    async def update_user_gamification(self, user: User, interaction_data: Dict) -> List[GamificationEvent]:
+        """Atualiza a gamificação do usuário baseada na interação."""
+        if not self.config.GAMIFICATION_ENABLED:
+            return []
+
+        events = []
+        
+        try:
+            xp_gained = self.config.XP_PER_INTERACTION
+            old_xp = user.total_xp
+            user.total_xp += xp_gained
+            
+            events.append(GamificationEvent(
+                event_type=GamificationEventType.XP_GAINED,
+                points_earned=xp_gained,
+                description=f"Ganhou {xp_gained} XP por interação",
+                timestamp=datetime.utcnow()
+            ))
+
+            old_level = user.level
+            new_level = self._calculate_level(user.total_xp)
+            if new_level > old_level:
+                user.level = new_level
+                events.append(GamificationEvent(
+                    event_type=GamificationEventType.LEVEL_UP,
+                    points_earned=0,
+                    description=f"Subiu para o nível {new_level}!",
+                    timestamp=datetime.utcnow(),
+                    metadata={'old_level': old_level, 'new_level': new_level}
+                ))
+
+            last_interaction = user.last_interaction
+            now = datetime.utcnow()
+            
+            if last_interaction:
+                days_diff = (now - last_interaction).days
+                if days_diff == 1:
+                    user.current_streak += 1
+                elif days_diff > 1:
+                    user.current_streak = 1
+            else:
+                user.current_streak = 1
+
+            user.last_interaction = now
+            
+            if user.current_streak > user.longest_streak:
+                user.longest_streak = user.current_streak
+
+            if user.current_streak in [7, 30, 100]:
+                events.append(GamificationEvent(
+                    event_type=GamificationEventType.STREAK_MILESTONE,
+                    points_earned=user.current_streak * 5,
+                    description=f"Marco de {user.current_streak} dias consecutivos!",
+                    timestamp=datetime.utcnow(),
+                    metadata={'streak_days': user.current_streak}
+                ))
+
+            new_badges = await self._check_new_badges(user, interaction_data)
+            for badge in new_badges:
+                if badge not in user.badges:
+                    user.badges.append(badge.value)
+                    events.append(GamificationEvent(
+                        event_type=GamificationEventType.BADGE_EARNED,
+                        points_earned=50,
+                        description=f"Conquistou o distintivo: {badge.value}",
+                        timestamp=datetime.utcnow(),
+                        metadata={'badge': badge.value}
+                    ))
+
+            user.recent_events = [event.dict() for event in events[-10:]]
+
+            return events
+
+        except Exception as e:
+            self.logger.error(f"Erro na gamificação para usuário {user.user_id}: {e}", exc_info=True)
+            return []
+
+    def _calculate_level(self, total_xp: int) -> int:
+        """Calcula o nível baseado no XP total."""
+        return int(math.sqrt(total_xp / 100)) + 1
+
+    async def _check_new_badges(self, user: User, interaction_data: Dict) -> List[BadgeType]:
+        """Verifica se o usuário conquistou novos badges."""
+        new_badges = []
+        
+        try:
+            if user.total_xp == self.config.XP_PER_INTERACTION:
+                new_badges.append(BadgeType.FIRST_INTERACTION)
+
+            if user.current_streak >= 7:
+                new_badges.append(BadgeType.CONSISTENCY_CHAMPION)
+
+            emotion = interaction_data.get('detected_emotion')
+            if emotion in ['alegria', 'calma']:
+                new_badges.append(BadgeType.EMOTIONAL_MASTER)
+
+            behavior = interaction_data.get('detected_behavior')
+            if behavior == 'comunicacao_assertiva':
+                new_badges.append(BadgeType.SOCIAL_BUTTERFLY)
+
+            intervention = interaction_data.get('intervention_type')
+            if intervention == 'mindfulness':
+                new_badges.append(BadgeType.MINDFUL_WARRIOR)
+
+            if user.level >= 5:
+                new_badges.append(BadgeType.PROGRESS_PIONEER)
+
+        except Exception as e:
+            self.logger.error(f"Erro ao verificar badges: {e}", exc_info=True)
+
+        return new_badges
+
+    async def get_user_gamification_profile(self, user: User) -> UserGamificationProfile:
+        """Obtém o perfil de gamificação do usuário."""
+        try:
+            recent_events = [
+                GamificationEvent(**event) for event in user.recent_events
+                if isinstance(event, dict)
+            ]
+            
+            return UserGamificationProfile(
+                user_id=user.user_id,
+                level=user.level,
+                total_xp=user.total_xp,
+                current_streak=user.current_streak,
+                longest_streak=user.longest_streak,
+                badges=[BadgeType(badge) for badge in user.badges if badge in [b.value for b in BadgeType]],
+                recent_events=recent_events
+            )
+        except Exception as e:
+            self.logger.error(f"Erro ao obter perfil de gamificação: {e}", exc_info=True)
+            return UserGamificationProfile(user_id=user.user_id)
+
+
+# Serviço LLM
+
+class LLMService:
+    def __init__(self, config: Config):
+        self.config = config
+        self.logger = logging.getLogger(__name__)
+        self.tokenizer = None
+        self.model = None
+
+        if DEEP_LEARNING_AVAILABLE:
+            self.initialize_llm()
+
+    def initialize_llm(self):
+        """Inicializa o modelo LLM e o tokenizador."""
+        try:
+            self.logger.info(f"Carregando tokenizer e modelo LLM: {self.config.LLM_MODEL_NAME}...")
+            self.tokenizer = AutoTokenizer.from_pretrained(self.config.LLM_MODEL_NAME)
+            self.model = AutoModelForCausalLM.from_pretrained(self.config.LLM_MODEL_NAME)
+            self.model.eval() # Modo de avaliação
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.logger.info("Modelo e tokenizer LLM carregados com sucesso.")
+        except Exception as e:
+            self.logger.error(f"Erro ao carregar LLM: {e}", exc_info=True)
+            global DEEP_LEARNING_AVAILABLE
+            DEEP_LEARNING_AVAILABLE = False
+            self.model = None
+
+    def generate_response(self, prompt: str, max_length: int = 150) -> str:
+        """Gera uma resposta usando o LLM."""
+        if not DEEP_LEARNING_AVAILABLE or not self.model or not self.tokenizer:
+            self.logger.warning("LLM indisponível. Usando fallback.")
+            return "Entendo. Estou aqui para te ajudar. Vamos trabalhar juntos para encontrar a melhor forma de abordar isso."
+
+        try:
+            inputs = self.tokenizer(prompt, return_tensors='pt', padding=True, truncation=True, max_length=512)
+            
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_length=max_length,
+                    num_return_sequences=1,
+                    temperature=0.7,
+                    top_p=0.9,
+                    do_sample=True,
+                    pad_token_id=self.tokenizer.eos_token_id
+                )
+            
+            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            
+            # Limpa o prompt da resposta gerada
+            response_text = response[len(prompt):].strip()
+            return response_text
+        except Exception as e:
+            self.logger.error(f"Erro ao gerar resposta com LLM: {e}", exc_info=True)
+            return "Entendo. Estou aqui para te ajudar. Vamos trabalhar juntos para encontrar a melhor forma de abordar isso."
+
+
+# Serviço Principal Vygotea
+
+class VygoteaService:
+    def __init__(self, config: Config):
+        self.config = config
+        self.logger = logging.getLogger(__name__)
+        
+        self.db_service = DatabaseService(config)
+        self.rag_engine = RAGEngine(config, self.db_service) if RAG_AVAILABLE else None
+        self.ml_service = MLService(config)
+        self.gamification_service = GamificationService(config)
+        self.llm_service = LLMService(config) if DEEP_LEARNING_AVAILABLE else None
+        
+        self.redis_client = None
+        if REDIS_AVAILABLE:
+            try:
+                self.redis_client = redis.from_url(config.REDIS_URL, decode_responses=True)
+                self.redis_client.ping()
+                self.logger.info("Redis conectado com sucesso.")
+            except Exception as e:
+                self.logger.warning(f"Falha ao conectar Redis: {e}")
+                self.redis_client = None
+
+    async def initialize(self):
+        """Inicializa o serviço."""
+        try:
+            await self.ml_service.load_models()
+            
+            training_data = await self.db_service.get_training_data(validated_only=True)
+            if len(training_data) >= self.config.MIN_TRAINING_SAMPLES:
+                self.logger.info("Retreinando modelos com dados validados...")
+                await self.ml_service.train_models(training_data)
+            
+            self.logger.info("Serviço Vygotea inicializado com sucesso.")
+            
+        except Exception as e:
+            self.logger.error(f"Erro na inicialização do serviço: {e}", exc_info=True)
+
+    async def process_user_input(self, user_input: UserInput) -> InterventionResponse:
+        """Processa entrada do usuário e gera resposta."""
+        start_time = datetime.utcnow()
+        
+        try:
+            user = await self.db_service.get_user_or_create(user_input.user_id)
+            
+            ml_analysis = await self.ml_service.predict(user_input.message)
+            
+            rag_context = []
+            if self.rag_engine and RAG_AVAILABLE:
+                rag_context = await self.rag_engine.search_knowledge(user_input.message)
+                ml_analysis.rag_context_used = len(rag_context) > 0
+            
+            zdp_assessment = await self._assess_zdp(user, ml_analysis, user_input.message)
+            
+            intervention_response = await self._generate_intervention_response(
+                user_input, ml_analysis, zdp_assessment, rag_context
+            )
+            
+            interaction_data = {
+                'detected_emotion': ml_analysis.emotion.value,
+                'detected_behavior': ml_analysis.behavior.value,
+                'intervention_type': intervention_response.intervention_type
+            }
+            
+            gamification_events = await self.gamification_service.update_user_gamification(
+                user, interaction_data
+            )
+            
+            await self.db_service.update_user(user)
+            
+            interaction_id = await self.db_service.save_interaction({
+                'user_id': user.id,
+                'session_id': user_input.session_id,
+                'user_message': user_input.message,
+                'context_data': json.dumps(user_input.context),
+                'detected_emotion': ml_analysis.emotion.value,
+                'emotion_confidence': ml_analysis.emotion_confidence,
+                'detected_behavior': ml_analysis.behavior.value,
+                'behavior_confidence': ml_analysis.behavior_confidence,
+                'intensity_level': ml_analysis.intensity.value,
+                'bot_response': intervention_response.response_text,
+                'intervention_type': intervention_response.intervention_type,
+                'processing_time_ms': ml_analysis.processing_time_ms,
+                'rag_context_used': ml_analysis.rag_context_used,
+                'rag_sources': [ctx.get('title', '') for ctx in rag_context]
+            })
+            
+            if zdp_assessment:
+                await self.db_service.save_progress_record({
+                    'user_id': user.id,
+                    'emotional_regulation': zdp_assessment.adaptive_progress.emotional_regulation,
+                    'social_skills': zdp_assessment.adaptive_progress.social_skills,
+                    'pedagogical_autonomy': zdp_assessment.adaptive_progress.pedagogical_autonomy,
+                    'emotional_comprehension': zdp_assessment.adaptive_progress.emotional_comprehension,
+                    'overall_progress': zdp_assessment.adaptive_progress.overall_progress,
+                    'interaction_id': interaction_id
+                })
+            
+            if (ml_analysis.emotion_confidence > self.config.MODEL_CONFIDENCE_THRESHOLD and
+                ml_analysis.behavior_confidence > self.config.MODEL_CONFIDENCE_THRESHOLD):
+                await self.db_service.add_training_data(
+                    user_input.message,
+                    ml_analysis.emotion.value,
+                    ml_analysis.behavior.value,
+                    ml_analysis.intensity.value,
+                    source="auto_confident"
+                )
+            
+            response = InterventionResponse(
+                response_text=intervention_response.response_text,
+                intervention_type=intervention_response.intervention_type,
+                zdp_assessment=zdp_assessment,
+                ml_analysis=ml_analysis,
+                suggested_activities=intervention_response.suggested_activities,
+                progress_indicators=intervention_response.progress_indicators,
+                gamification_events=gamification_events,
+                adaptive_progress=zdp_assessment.adaptive_progress if zdp_assessment else AdaptiveProgressMetrics(
+                    emotional_regulation=0.5,
+                    social_skills=0.5,
+                    pedagogical_autonomy=0.5,
+                    emotional_comprehension=0.5,
+                    overall_progress=0.5
+                )
+            )
+            
+            EMOTION_PREDICTIONS.labels(emotion=ml_analysis.emotion.value).inc()
+            INTERVENTION_SUCCESS.labels(type=intervention_response.intervention_type).inc()
+            for event in gamification_events:
+                GAMIFICATION_EVENTS.labels(event_type=event.event_type.value).inc()
+            
+            if zdp_assessment:
+                USER_PROGRESS.labels(user_id=user_input.user_id).set(
+                    zdp_assessment.adaptive_progress.overall_progress
+                )
+            
+            return response
+            
+        except Exception as e:
+            self.logger.error(f"Erro ao processar entrada do usuário: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail="Erro interno do servidor")
+
+    async def _assess_zdp(self, user: User, ml_analysis: MLAnalysisResult, message: str) -> Optional[ZDPAssessment]:
+        """Avalia a Zona de Desenvolvimento Proximal do usuário."""
+        try:
+            progress_history = await self.db_service.get_user_progress_history(user.user_id, limit=10)
+            
+            current_emotional_reg = self._calculate_emotional_regulation_score(ml_analysis, progress_history)
+            current_social_skills = self._calculate_social_skills_score(ml_analysis, progress_history)
+            current_pedagogical_auto = self._calculate_pedagogical_autonomy_score(ml_analysis, progress_history)
+            current_emotional_comp = self._calculate_emotional_comprehension_score(ml_analysis, progress_history)
+            
+            overall_progress = (
+                current_emotional_reg * self.config.BETA_EMOTIONAL_REG +
+                current_social_skills * self.config.BETA_SOCIAL_SKILLS +
+                current_pedagogical_auto * self.config.BETA_PEDAGOGICAL_AUTO +
+                current_emotional_comp * self.config.BETA_EMOTIONAL_COMP
+            )
+            
+            adaptive_progress = AdaptiveProgressMetrics(
+                emotional_regulation=current_emotional_reg,
+                social_skills=current_social_skills,
+                pedagogical_autonomy=current_pedagogical_auto,
+                emotional_comprehension=current_emotional_comp,
+                overall_progress=overall_progress
+            )
+            
+            proximal_zone = self._calculate_proximal_zone(overall_progress)
+            
+            recommendations = self._generate_zdp_recommendations(adaptive_progress, ml_analysis)
+            
+            support_level = self._determine_support_level(adaptive_progress, ml_analysis)
+            
+            development_potential = self._calculate_development_potential(adaptive_progress, progress_history)
+            
+            return ZDPAssessment(
+                user_id=user.user_id,
+                current_level={
+                    'emotional_regulation': current_emotional_reg,
+                    'social_skills': current_social_skills,
+                    'pedagogical_autonomy': current_pedagogical_auto,
+                    'emotional_comprehension': current_emotional_comp,
+                    'overall': overall_progress
+                },
+                proximal_zone=proximal_zone,
+                development_potential=development_potential,
+                recommendations=recommendations,
+                support_level=support_level,
+                confidence=0.85,
+                adaptive_progress=adaptive_progress
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Erro na avaliação ZDP: {e}", exc_info=True)
+            return None
+
+    def _calculate_emotional_regulation_score(self, ml_analysis: MLAnalysisResult, history: List[Dict]) -> float:
+        """Calcula score de regulação emocional."""
+        base_score = 0.5
+        
+        if ml_analysis.emotion in [EmotionType.ALEGRIA, EmotionType.CALMA]:
+            base_score += 0.2
+        elif ml_analysis.emotion in [EmotionType.ANSIEDADE, EmotionType.RAIVA]:
+            base_score -= 0.1
+        
+        if ml_analysis.intensity == IntensityLevel.BAIXA:
+            base_score += 0.1
+        elif ml_analysis.intensity == IntensityLevel.ALTA:
+            base_score -= 0.1
+        
+        if history:
+            recent_scores = [h.get('emotional_regulation', 0.5) for h in history[:5]]
+            trend = np.mean(recent_scores)
+            base_score = base_score * 0.7 + trend * 0.3
+        
+        return max(0.0, min(1.0, base_score))
+
+    def _calculate_social_skills_score(self, ml_analysis: MLAnalysisResult, history: List[Dict]) -> float:
+        """Calcula score de habilidades sociais."""
+        base_score = 0.5
+        
+        if ml_analysis.behavior == BehaviorType.COMUNICACAO_ASSERTIVA:
+            base_score += 0.3
+        elif ml_analysis.behavior == BehaviorType.ISOLAMENTO_SOCIAL:
+            base_score -= 0.2
+        
+        if history:
+            recent_scores = [h.get('social_skills', 0.5) for h in history[:5]]
+            trend = np.mean(recent_scores)
+            base_score = base_score * 0.6 + trend * 0.4
+        
+        return max(0.0, min(1.0, base_score))
+
+    def _calculate_pedagogical_autonomy_score(self, ml_analysis: MLAnalysisResult, history: List[Dict]) -> float:
+        """Calcula score de autonomia pedagógica."""
+        base_score = 0.5
+        
+        if ml_analysis.behavior == BehaviorType.AUTOCONTROLE_POSITIVO:
+            base_score += 0.2
+        elif ml_analysis.behavior == BehaviorType.COMPORTAMENTO_PROBLEMA:
+            base_score -= 0.1
+        
+        if history:
+            recent_scores = [h.get('pedagogical_autonomy', 0.5) for h in history[:5]]
+            trend = np.mean(recent_scores)
+            base_score = base_score * 0.7 + trend * 0.3
+        
+        return max(0.0, min(1.0, base_score))
+
+    def _calculate_emotional_comprehension_score(self, ml_analysis: MLAnalysisResult, history: List[Dict]) -> float:
+        """Calcula score de compreensão emocional."""
+        base_score = 0.5
+        
+        confidence_avg = (ml_analysis.emotion_confidence + ml_analysis.behavior_confidence) / 2
+        base_score += (confidence_avg - 0.5) * 0.2
+        
+        if history:
+            recent_scores = [h.get('emotional_comprehension', 0.5) for h in history[:5]]
+            trend = np.mean(recent_scores)
+            base_score = base_score * 0.8 + trend * 0.2
+        
+        return max(0.0, min(1.0, base_score))
+
+    def _calculate_proximal_zone(self, current_level: float) -> Dict[str, Any]:
+        """Calcula a zona de desenvolvimento proximal."""
+        zone_width = 0.2
+        return {
+            'lower_bound': max(0.0, current_level - zone_width/2),
+            'upper_bound': min(1.0, current_level + zone_width/2),
+            'optimal_challenge_level': min(1.0, current_level + zone_width/3),
+            'support_level_required': 'high' if current_level < 0.3 else 'medium' if current_level < 0.7 else 'low'
+        }
+
+    def _generate_zdp_recommendations(self, progress: AdaptiveProgressMetrics, ml_analysis: MLAnalysisResult) -> List[str]:
+        """Gera recomendações personalizadas baseadas na ZDP."""
+        recommendations = []
+        
+        if progress.emotional_regulation < 0.6:
+            recommendations.append("Pratique técnicas de respiração profunda e mindfulness diariamente")
+            recommendations.append("Identifique e registre seus gatilhos emocionais em um diário")
+        
+        if progress.social_skills < 0.6:
+            recommendations.append("Pratique conversas em situações sociais de baixo risco")
+            recommendations.append("Observe e imite comportamentos sociais positivos de outros")
+        
+        if progress.pedagogical_autonomy < 0.6:
+            recommendations.append("Estabeleça metas pequenas e alcançáveis diariamente")
+            recommendations.append("Pratique tomada de decisões em situações simples")
+        
+        if progress.emotional_comprehension < 0.6:
+            recommendations.append("Use cartões de emoções para identificar sentimentos")
+            recommendations.append("Pratique nomear emoções quando elas surgem")
+        
+        if ml_analysis.emotion == EmotionType.ANSIEDADE:
+            recommendations.append("Experimente técnicas de aterramento como contar objetos ao redor")
+        elif ml_analysis.emotion == EmotionType.TRISTEZA:
+            recommendations.append("Busque atividades que tragam sensação de realização")
+        
+        return recommendations[:5]
+
+    def _determine_support_level(self, progress: AdaptiveProgressMetrics, ml_analysis: MLAnalysisResult) -> str:
+        """Determina o nível de suporte necessário."""
+        avg_progress = progress.overall_progress
+        
+        if avg_progress < 0.3 or ml_analysis.intensity == IntensityLevel.ALTA:
+            return "alto"
+        elif avg_progress < 0.7:
+            return "médio"
+        else:
+            return "baixo"
+
+    def _calculate_development_potential(self, progress: AdaptiveProgressMetrics, history: List[Dict]) -> Dict[str, Any]:
+        """Calcula o potencial de desenvolvimento."""
+        if not history:
+            return {
+                'growth_rate': 0.0,
+                'predicted_progress_1week': progress.overall_progress + 0.05,
+                'areas_with_highest_potential': ['emotional_regulation', 'social_skills']
+            }
+        
+        recent_progress = [h.get('overall_progress', 0.5) for h in history[:5]]
+        if len(recent_progress) > 1:
+            growth_rate = (recent_progress[0] - recent_progress[-1]) / len(recent_progress)
+        else:
+            growth_rate = 0.0
+        
+        areas = {
+            'emotional_regulation': progress.emotional_regulation,
+            'social_skills': progress.social_skills,
+            'pedagogical_autonomy': progress.pedagogical_autonomy,
+            'emotional_comprehension': progress.emotional_comprehension
+        }
+        
+        areas_potential = sorted(areas.items(), key=lambda x: x[1])[:2]
+        
+        return {
+            'growth_rate': growth_rate,
+            'predicted_progress_1week': min(1.0, progress.overall_progress + max(0.02, growth_rate * 7)),
+            'areas_with_highest_potential': [area[0] for area in areas_potential]
+        }
+
+    async def _generate_intervention_response(
+        self, 
+        user_input: UserInput, 
+        ml_analysis: MLAnalysisResult, 
+        zdp_assessment: Optional[ZDPAssessment],
+        rag_context: List[Dict]
+    ) -> InterventionResponse:
+        """Gera resposta de intervenção personalizada."""
+        try:
+            intervention_type = self._select_intervention_type(ml_analysis, zdp_assessment)
+            
+            prompt = self._build_llm_prompt(user_input.message, ml_analysis, zdp_assessment, rag_context, intervention_type)
+
+            response_text = "Entendo. Estou aqui para te ajudar. Vamos trabalhar juntos para encontrar a melhor forma de abordar isso."
+            if self.llm_service:
+                response_text = self.llm_service.generate_response(prompt)
+            
+            suggested_activities = self._generate_suggested_activities(ml_analysis, zdp_assessment)
+            
+            progress_indicators = self._generate_progress_indicators(zdp_assessment)
+            
+            return InterventionResponse(
+                response_text=response_text,
+                intervention_type=intervention_type,
+                zdp_assessment=zdp_assessment,
+                ml_analysis=ml_analysis,
+                suggested_activities=suggested_activities,
+                progress_indicators=progress_indicators,
+                adaptive_progress=zdp_assessment.adaptive_progress if zdp_assessment else AdaptiveProgressMetrics(
+                    emotional_regulation=0.5,
+                    social_skills=0.5,
+                    pedagogical_autonomy=0.5,
+                    emotional_comprehension=0.5,
+                    overall_progress=0.5
+                )
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Erro ao gerar resposta de intervenção: {e}", exc_info=True)
+            return InterventionResponse(
+                response_text="Entendo como você está se sentindo. Vamos trabalhar juntos para encontrar estratégias que possam ajudar.",
+                intervention_type=InterventionType.GENERAL_SUPPORT.value,
+                ml_analysis=ml_analysis,
+                adaptive_progress=AdaptiveProgressMetrics(
+                    emotional_regulation=0.5,
+                    social_skills=0.5,
+                    pedagogical_autonomy=0.5,
+                    emotional_comprehension=0.5,
+                    overall_progress=0.5
+                )
+            )
+
+    def _select_intervention_type(self, ml_analysis: MLAnalysisResult, zdp_assessment: Optional[ZDPAssessment]) -> str:
+        """Seleciona o tipo de intervenção mais apropriado."""
+        if ml_analysis.emotion in [EmotionType.ANSIEDADE, EmotionType.MEDO]:
+            if ml_analysis.intensity == IntensityLevel.ALTA:
+                return InterventionType.MINDFULNESS.value
+            else:
+                return InterventionType.COGNITIVE_REFRAMING.value
+        
+        elif ml_analysis.emotion == EmotionType.TRISTEZA:
+            return InterventionType.BEHAVIORAL_ACTIVATION.value
+        
+        elif ml_analysis.emotion == EmotionType.RAIVA:
+            return InterventionType.EMOTIONAL_REGULATION.value
+        
+        elif ml_analysis.behavior == BehaviorType.ISOLAMENTO_SOCIAL:
+            return InterventionType.SOCIAL_SKILLS.value
+        
+        elif ml_analysis.behavior == BehaviorType.COMPORTAMENTO_PROBLEMA:
+            return InterventionType.ABA_REINFORCEMENT.value
+        
+        elif zdp_assessment and zdp_assessment.support_level == "alto":
+            return InterventionType.ABA_SKILL_BUILDING.value
+        
+        else:
+            return InterventionType.GENERAL_SUPPORT.value
+
+    def _build_llm_prompt(self, message: str, ml_analysis: MLAnalysisResult, zdp_assessment: Optional[ZDPAssessment], rag_context: List[Dict], intervention_type: str) -> str:
+        """Constrói o prompt para o LLM."""
+        prompt_parts = []
+        
+        prompt_parts.append(f"O usuário disse: '{message}'")
+        prompt_parts.append(f"Análise: Emoção detectada: {ml_analysis.emotion.value}, Comportamento: {ml_analysis.behavior.value}, Intensidade: {ml_analysis.intensity.value}.")
+        
+        if zdp_assessment:
+            prompt_parts.append(f"Progresso atual: {zdp_assessment.adaptive_progress.overall_progress:.2f}. Nível de suporte recomendado: {zdp_assessment.support_level}.")
+            prompt_parts.append(f"Recomendações: {', '.join(zdp_assessment.recommendations)}")
+
+        if rag_context:
+            context_text = " ".join([f"Título: {doc['title']}. Conteúdo: {doc['content']}" for doc in rag_context])
+            prompt_parts.append(f"Contexto relevante: {context_text}")
+        
+        prompt_parts.append(f"Com base nas informações acima, e utilizando uma abordagem de intervenção tipo '{intervention_type}', crie uma resposta empática e útil para o usuário. A resposta deve ser curta (no máximo 50 palavras) e encorajadora. Aja como um assistente educacional.")
+        
+        return " ".join(prompt_parts)
+
+    def _generate_suggested_activities(self, ml_analysis: MLAnalysisResult, zdp_assessment: Optional[ZDPAssessment]) -> List[str]:
+        """Gera atividades sugeridas baseadas na análise."""
+        activities = []
+        
+        emotion_activities = {
+            EmotionType.ANSIEDADE: [
+                "Pratique respiração 4-7-8 por 5 minutos",
+                "Liste 5 coisas que você pode ver, 4 que pode ouvir, 3 que pode tocar",
+                "Escreva suas preocupações em um papel"
+            ],
+            EmotionType.TRISTEZA: [
+                "Faça uma caminhada de 10 minutos ao ar livre",
+                "Escute uma música que você gosta",
+                "Entre em contato com um amigo ou familiar"
+            ],
+            EmotionType.RAIVA: [
+                "Conte até 10 antes de reagir",
+                "Faça exercícios físicos leves",
+                "Escreva sobre o que está causando raiva"
+            ],
+            EmotionType.MEDO: [
+                "Pratique técnicas de relaxamento muscular",
+                "Visualize um lugar seguro e tranquilo",
+                "Questione os pensamentos de medo com evidências"
+            ]
+        }
+        
+        activities.extend(emotion_activities.get(ml_analysis.emotion, []))
+        
+        if zdp_assessment:
+            if zdp_assessment.adaptive_progress.emotional_regulation < 0.6:
+                activities.append("Mantenha um diário emocional diário")
+            
+            if zdp_assessment.adaptive_progress.social_skills < 0.6:
+                activities.append("Pratique iniciar conversas com uma pergunta simples")
+            
+            if zdp_assessment.adaptive_progress.pedagogical_autonomy < 0.6:
+                activities.append("Defina uma meta pequena para hoje e trabalhe para alcançá-la")
+        
+        return activities[:5]
+
+    def _generate_progress_indicators(self, zdp_assessment: Optional[ZDPAssessment]) -> Dict[str, Any]:
+        """Gera indicadores de progresso."""
+        if not zdp_assessment:
+            return {}
+        
+        return {
+            'current_level': zdp_assessment.current_level,
+            'areas_of_strength': [
+                area for area, score in zdp_assessment.current_level.items() 
+                if score > 0.7 and area != 'overall'
+            ],
+            'areas_for_improvement': [
+                area for area, score in zdp_assessment.current_level.items() 
+                if score < 0.5 and area != 'overall'
+            ],
+            'next_milestone': zdp_assessment.proximal_zone['optimal_challenge_level'],
+            'support_recommendation': zdp_assessment.support_level,
+            'confidence_level': zdp_assessment.confidence
+        }
+
+    async def save_feedback(self, feedback_data: FeedbackData) -> bool:
+        """Salva feedback do usuário."""
+        try:
+            await self.db_service.save_feedback(feedback_data)
+            
+            if feedback_data.feedback_score <= 2:
+                self.logger.info(f"Feedback negativo recebido: {feedback_data.feedback_score}")
+            
+            return True
+        except Exception as e:
+            self.logger.error(f"Erro ao salvar feedback: {e}", exc_info=True)
+            return False
+
+    async def get_user_analytics(self, user_id: str) -> Dict[str, Any]:
+        """Obtém analytics do usuário."""
+        try:
+            user = await self.db_service.get_user_or_create(user_id)
+            history = await self.db_service.get_user_history(user_id, limit=50)
+            progress_history = await self.db_service.get_user_progress_history(user_id, limit=30)
+            gamification_profile = await self.gamification_service.get_user_gamification_profile(user)
+            
+            total_interactions = len(history)
+            avg_satisfaction = np.mean([h.get('feedback_score', 3) for h in history if h.get('feedback_score')]) if history else 0
+            
+            if progress_history:
+                recent_progress = [p['overall_progress'] for p in progress_history[:10]]
+                progress_trend = "crescente" if len(recent_progress) > 1 and recent_progress[0] > recent_progress[-1] else "estável"
+            else:
+                progress_trend = "sem dados"
+            
+            emotions = [h.get('detected_emotion', '') for h in history]
+            emotion_counts = pd.Series(emotions).value_counts().to_dict() if emotions else {}
+            
+            return {
+                'user_id': user_id,
+                'total_interactions': total_interactions,
+                'average_satisfaction': avg_satisfaction,
+                'progress_trend': progress_trend,
+                'most_frequent_emotions': emotion_counts,
+                'gamification_profile': gamification_profile.dict(),
+                'last_interaction': history[0]['timestamp'] if history else None,
+                'current_streak': user.current_streak,
+                'total_xp': user.total_xp
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Erro ao obter analytics do usuário {user_id}: {e}", exc_info=True)
+            return {}
+
+
+# API FastAPI
+
+logging.basicConfig(
+    level=getattr(logging, Config().LOG_LEVEL.upper()),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
+config = Config()
+vygotea_service = VygoteaService(config)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logging.info("Iniciando serviço Vygotea...")
+    await vygotea_service.initialize()
+    logging.info("Serviço Vygotea iniciado com sucesso!")
+    yield
+    logging.info("Finalizando serviço Vygotea...")
+
+app = FastAPI(
+    title="Vygotea API",
+    description="API para assistente educacional baseado em teorias de Vygotsky e ABA",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=config.CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.middleware("http")
+async def add_process_time_header(request: Request, call_next):
+    start_time = datetime.utcnow()
+    response = await call_next(request)
+    process_time = (datetime.utcnow() - start_time).total_seconds()
+    REQUEST_DURATION.observe(process_time)
+    response.headers["X-Process-Time"] = str(process_time)
+    REQUEST_COUNT.labels(endpoint=request.url.path, method=request.method).inc()
+    return response
+
+@app.post("/api/chat", response_model=InterventionResponse, status_code=status.HTTP_200_OK)
+async def chat_endpoint(user_input: UserInput):
+    """
+    Processa a entrada do usuário e retorna uma resposta de intervenção.
+    """
+    try:
+        response = await vygotea_service.process_user_input(user_input)
+        return response
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logging.error(f"Erro no endpoint /api/chat: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Erro interno no servidor ao processar a requisição.")
+
+@app.post("/api/feedback", status_code=status.HTTP_201_CREATED)
+async def submit_feedback(feedback: FeedbackData):
+    """
+    Recebe feedback do usuário para melhorar o sistema.
+    """
+    if await vygotea_service.save_feedback(feedback):
+        return {"message": "Feedback recebido com sucesso."}
+    else:
+        raise HTTPException(status_code=500, detail="Não foi possível salvar o feedback.")
+
+@app.get("/api/analytics/{user_id}", status_code=status.HTTP_200_OK)
+async def get_user_analytics(user_id: str):
+    """
+    Retorna dados analíticos e de progresso para um usuário específico.
+    """
+    analytics = await vygotea_service.get_user_analytics(user_id)
+    if not analytics:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado ou sem dados.")
+    return analytics
+
+@app.get("/metrics", status_code=status.HTTP_200_OK)
+def get_metrics():
+    """
+    Endpoint para métricas do Prometheus.
+    """
+    return Response(content=generate_latest().decode('utf-8'), media_type="text/plain")
