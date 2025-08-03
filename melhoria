@@ -1,0 +1,518 @@
+import pandas as pd
+import numpy as np
+import json
+import random
+from datetime import datetime, timedelta
+from typing import Dict, List, Tuple, Optional
+import re
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import classification_report, accuracy_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+from collections import defaultdict
+import warnings
+
+warnings.filterwarnings('ignore')
+
+# Definição das classes SyntheticDataGenerator, VygotEAEngine e VygotEAAnalyzer
+# COLOQUE AQUI AS DEFINIÇÕES COMPLETAS DAS CLASSES
+# SyntheticDataGenerator, VygotEAEngine, VygotEAAnalyzer
+# conforme o código que você já forneceu.
+# Por brevidade, não as repito aqui, mas elas devem estar presentes no seu notebook.
+
+class SyntheticDataGenerator:
+    """Gerador de dados sintéticos para estudantes com TEA"""
+
+    def __init__(self):
+        self.student_profiles = {
+            'perfil_1': {
+                'idade': 15,
+                'nivel_desenvolvimento': 'intermediario',
+                'caracteristicas': ['ansiedade_social', 'sensibilidade_sensorial', 'interesse_restrito_tecnologia'],
+                'habilidades_sociais': 3,  # escala 1-5
+                'autorregulacao': 2,
+                'comunicacao': 4
+            },
+            'perfil_2': {
+                'idade': 16,
+                'nivel_desenvolvimento': 'avancado',
+                'caracteristicas': ['perfeccionismo', 'dificuldade_mudancas', 'boa_memoria'],
+                'habilidades_sociais': 4,
+                'autorregulacao': 3,
+                'comunicacao': 5
+            },
+            'perfil_3': {
+                'idade': 14,
+                'nivel_desenvolvimento': 'inicial',
+                'caracteristicas': ['dificuldade_expressao', 'comportamento_repetitivo', 'sensibilidade_ruido'],
+                'habilidades_sociais': 2,
+                'autorregulacao': 2,
+                'comunicacao': 2
+            },
+            'perfil_4': {
+                'idade': 17,
+                'nivel_desenvolvimento': 'avancado',
+                'caracteristicas': ['alta_funcionalidade', 'interesse_ciencias', 'dificuldade_interpretacao_social'],
+                'habilidades_sociais': 3,
+                'autorregulacao': 4,
+                'comunicacao': 4
+            },
+            'perfil_5': {
+                'idade': 15,
+                'nivel_desenvolvimento': 'intermediario',
+                'caracteristicas': ['ansiedade_performance', 'rotinas_rigidas', 'interesse_arte'],
+                'habilidades_sociais': 3,
+                'autorregulacao': 3,
+                'comunicacao': 3
+            }
+        }
+
+        self.situacoes_contextuais = [
+            'prova_aproximando', 'conflito_colega', 'mudanca_rotina', 'apresentacao_publica',
+            'barulho_excessivo', 'tarefa_dificil', 'recreio_sozinho', 'elogio_professor',
+            'critica_trabalho', 'atividade_grupo', 'dia_chuva', 'substituicao_professor'
+        ]
+
+        self.emocoes_categorias = {
+            'ansiedade': ['nervoso', 'preocupado', 'tenso', 'inquieto', 'apreensivo'],
+            'frustacao': ['irritado', 'chateado', 'desapontado', 'impaciente', 'zangado'],
+            'tristeza': ['triste', 'desanimado', 'melancólico', 'abatido', 'deprimido'],
+            'alegria': ['feliz', 'animado', 'contente', 'eufórico', 'satisfeito'],
+            'medo': ['assustado', 'receoso', 'temeroso', 'aterrorizado', 'inseguro'],
+            'calma': ['tranquilo', 'sereno', 'relaxado', 'pacífico', 'equilibrado']
+        }
+
+        self.estrategias_aba = {
+            'autorregulacao': [
+                'respiracao_profunda', 'contagem_regressiva', 'visualizacao_positiva',
+                'pausas_programadas', 'automonitoramento', 'relaxamento_muscular'
+            ],
+            'habilidades_sociais': [
+                'modelagem_comportamento', 'role_play', 'feedback_positivo',
+                'ensino_direto', 'pratica_guiada', 'generalizacao'
+            ],
+            'comunicacao': [
+                'linguagem_clara', 'apoio_visual', 'tempo_processamento',
+                'validacao_emocional', 'reformulacao', 'pergunta_aberta'
+            ]
+        }
+        self.fixed_interactions_df = None
+
+    def generate_fixed_student_interactions(self, num_interactions: int = 1000) -> pd.DataFrame:
+        """Gera interações sintéticas fixas para garantir a reprodutibilidade"""
+        if self.fixed_interactions_df is not None:
+            return self.fixed_interactions_df
+
+        random.seed(42) # Fixa a semente para reprodutibilidade
+        np.random.seed(42)
+
+        interactions = []
+
+        for i in range(num_interactions):
+            profile_id = random.choice(list(self.student_profiles.keys()))
+            profile = self.student_profiles[profile_id]
+            situacao = random.choice(self.situacoes_contextuais)
+            emocao_categoria = self._select_emotion_category(profile, situacao)
+            emocao = random.choice(self.emocoes_categorias[emocao_categoria])
+            mensagem_estudante = self._generate_student_message(profile, situacao, emocao)
+            mensagem_estudante = self._add_noise(mensagem_estudante)
+            resposta_chatbot = self._generate_chatbot_response(profile_id, emocao_categoria, situacao)
+            progresso = self._calculate_adaptive_progress(profile, i)
+
+            interactions.append({
+                'interaction_id': i + 1,
+                'student_profile': profile_id,
+                'timestamp': datetime.now() - timedelta(days=random.randint(0, 30)),
+                'situacao_contextual': situacao,
+                'emocao_categoria': emocao_categoria,
+                'emocao_especifica': emocao,
+                'mensagem_estudante': mensagem_estudante,
+                'resposta_chatbot': resposta_chatbot,
+                'estrategia_aba': self._select_aba_strategy(emocao_categoria),
+                'nivel_zdp': self._determine_zdp_level(profile),
+                'progresso_adaptativo': progresso,
+                'satisfacao_resposta': random.uniform(3.5, 5.0),
+                'duracao_interacao': random.randint(30, 300)
+            })
+
+        self.fixed_interactions_df = pd.DataFrame(interactions)
+        return self.fixed_interactions_df
+
+    def _select_emotion_category(self, profile: Dict, situacao: str) -> str:
+        situacao_emocao = {
+            'prova_aproximando': 'ansiedade', 'conflito_colega': 'frustacao',
+            'mudanca_rotina': 'ansiedade', 'apresentacao_publica': 'medo',
+            'barulho_excessivo': 'frustacao', 'tarefa_dificil': 'frustacao',
+            'recreio_sozinho': 'tristeza', 'elogio_professor': 'alegria',
+            'critica_trabalho': 'tristeza', 'atividade_grupo': 'ansiedade',
+            'dia_chuva': 'calma', 'substituicao_professor': 'ansiedade'
+        }
+        base_emotion = situacao_emocao.get(situacao, 'ansiedade')
+        if profile['autorregulacao'] >= 4:
+            return random.choice([base_emotion, 'calma'])
+        return base_emotion
+
+    def _generate_student_message(self, profile: Dict, situacao: str, emocao: str) -> str:
+        templates = {
+            'ansiedade': [f"Estou {emocao} com {situacao.replace('_', ' ')}", f"Não consigo parar de pensar na {situacao.replace('_', ' ')}", f"Me sinto {emocao} e não sei o que fazer"],
+            'frustacao': [f"Estou {emocao} porque {situacao.replace('_', ' ')}", f"Isso é muito difícil, me sinto {emocao}", f"Não consigo lidar com {situacao.replace('_', ' ')}"],
+            'tristeza': [f"Me sinto {emocao} hoje", f"Estou {emocao} por causa de {situacao.replace('_', ' ')}", f"Não estou bem, me sinto {emocao}"],
+            'alegria': [f"Estou {emocao} com {situacao.replace('_', ' ')}", f"Me sinto {emocao} hoje!", f"Que bom, estou {emocao}!"],
+            'medo': [f"Estou {emocao} com {situacao.replace('_', ' ')}", f"Tenho medo de {situacao.replace('_', ' ')}", f"Me sinto {emocao} e inseguro"],
+            'calma': [f"Estou {emocao} hoje", f"Me sinto {emocao} e bem", f"Estou {emocao} apesar de {situacao.replace('_', ' ')}"]
+        }
+        emotion_category = None
+        for category, emotions in self.emocoes_categorias.items():
+            if emocao in emotions:
+                emotion_category = category
+                break
+        if emotion_category and emotion_category in templates:
+            return random.choice(templates[emotion_category])
+        return f"Estou me sentindo {emocao} hoje"
+
+    def _add_noise(self, message: str) -> str:
+        if random.random() < 0.1:
+            return message + " " + random.choice(["...", "??", "!", "não sei"])
+        return message
+
+    def _generate_chatbot_response(self, profile_id: str, emocao_categoria: str, situacao: str) -> str:
+        estrategias = {
+            'ansiedade': ["Percebo que você está se sentindo ansioso. Vamos tentar uma técnica de respiração juntos?", "Entendo sua preocupação. Que tal dividirmos essa situação em partes menores?", "Você está sendo muito corajoso ao compartilhar isso. Vamos pensar em estratégias?"],
+            'frustacao': ["Vejo que você está frustrado. Isso é normal e compreensível. Vamos conversar sobre isso?", "Suas emoções são válidas. Que tal tentarmos uma abordagem diferente para essa situação?", "Percebo sua frustração. Vamos pausar e pensar juntos em uma solução?"],
+            'tristeza': ["Obrigado por compartilhar como está se sentindo. Estou aqui para apoiá-lo.", "Entendo que você está passando por um momento difícil. Vamos conversar sobre isso?", "Suas emoções são importantes. Como posso ajudá-lo a se sentir melhor?"],
+            'alegria': ["Que maravilha saber que você está se sentindo bem! Conte-me mais sobre isso.", "Fico feliz em saber que você está animado! Vamos celebrar esse momento positivo.", "Sua alegria é contagiante! Como podemos manter esse sentimento positivo?"],
+            'medo': ["Entendo que você está com medo. Vamos enfrentar isso juntos, passo a passo.", "Seus medos são válidos. Que tal conversarmos sobre estratégias para se sentir mais seguro?", "Obrigado por confiar em mim. Vamos trabalhar juntos para superar esse medo."],
+            'calma': ["Que bom saber que você está se sentindo tranquilo! Como conseguiu alcançar essa calma?", "Sua serenidade é admirável. Vamos aproveitar esse momento para planejar estratégias futuras?", "Fico feliz em saber que você está em equilíbrio. Vamos manter esse bem-estar?"]
+        }
+        nivel_zdp = self.student_profiles[profile_id].get('nivel_desenvolvimento', 'intermediario')
+        base_response = random.choice(estrategias.get(emocao_categoria, estrategias['ansiedade']))
+        if nivel_zdp == 'inicial':
+            return base_response + " Vamos começar com algo bem simples."
+        elif nivel_zdp == 'avancado':
+            return base_response + " Podemos explorar estratégias mais elaboradas para lidar com essa situação."
+        else:
+            return base_response + " Vamos trabalhar nisso juntos, no seu ritmo."
+
+    def _select_aba_strategy(self, emocao_categoria: str) -> str:
+        if emocao_categoria in ['ansiedade', 'medo']:
+            return random.choice(self.estrategias_aba['autorregulacao'])
+        elif emocao_categoria in ['frustacao', 'tristeza']:
+            return random.choice(self.estrategias_aba['habilidades_sociais'])
+        else:
+            return random.choice(self.estrategias_aba['comunicacao'])
+
+    def _determine_zdp_level(self, profile: Dict) -> str:
+        return profile['nivel_desenvolvimento']
+
+    def _calculate_adaptive_progress(self, profile: Dict, interaction_num: int) -> float:
+        alpha = 0.3
+        base_engagement = (profile['habilidades_sociais'] + profile['autorregulacao'] + profile['comunicacao']) / 15
+        current_engagement = base_engagement + random.uniform(-0.1, 0.1)
+        current_engagement = max(0, min(1, current_engagement))
+        if interaction_num == 0:
+            previous_progress = base_engagement
+        else:
+            previous_progress = base_engagement + (interaction_num * 0.001)
+        progress = alpha * current_engagement + (1 - alpha) * previous_progress
+        return round(progress, 3)
+
+class VygotEAEngine:
+    """Motor principal do VygotEA com capacidades de ML"""
+
+    def __init__(self):
+        self.vectorizer = TfidfVectorizer(max_features=1000, stop_words='english')
+        self.emotion_classifier = LogisticRegression(random_state=42)
+        self.interaction_history = []
+        self.knowledge_base = {}
+        self.trained = False
+
+    def train_emotion_classifier(self, interactions_df: pd.DataFrame):
+        print("Treinando classificador de emoções...")
+        X = interactions_df['mensagem_estudante'].values
+        y = interactions_df['emocao_categoria'].values
+        X_vectorized = self.vectorizer.fit_transform(X)
+        X_train, X_test, y_train, y_test = train_test_split(X_vectorized, y, test_size=0.2, random_state=42)
+        self.emotion_classifier.fit(X_train, y_train)
+        y_pred = self.emotion_classifier.predict(X_test)
+        accuracy = accuracy_score(y_test, y_pred)
+        print(f"Acurácia do classificador: {accuracy:.3f}")
+        print("\nRelatório de classificação:")
+        print(classification_report(y_test, y_pred))
+        self.trained = True
+        return accuracy
+
+    def predict_emotion(self, message: str) -> Tuple[str, float]:
+        if not self.trained:
+            raise ValueError("Modelo não foi treinado ainda!")
+        message_vec = self.vectorizer.transform([message])
+        prediction = self.emotion_classifier.predict(message_vec)[0]
+        probability = self.emotion_classifier.predict_proba(message_vec).max()
+        return prediction, probability
+
+    def generate_response(self, message: str, student_profile: Dict) -> Dict:
+        if self.trained:
+            emotion, confidence = self.predict_emotion(message)
+        else:
+            emotion = 'ansiedade'
+            confidence = 0.5
+        aba_strategy = self._select_aba_strategy(emotion)
+        zdp_level = student_profile.get('nivel_desenvolvimento', 'intermediario')
+        response = self._generate_adaptive_response(emotion, zdp_level, aba_strategy)
+        return {
+            'emotion_detected': emotion,
+            'confidence': confidence,
+            'aba_strategy': aba_strategy,
+            'zdp_level': zdp_level,
+            'response': response,
+            'timestamp': datetime.now()
+        }
+
+    def _select_aba_strategy(self, emotion: str) -> str:
+        strategies = {
+            'ansiedade': 'autorregulacao', 'frustacao': 'habilidades_sociais',
+            'tristeza': 'comunicacao', 'alegria': 'reforco_positivo',
+            'medo': 'dessensibilizacao_sistematica', 'calma': 'manutencao_estado'
+        }
+        return strategies.get(emotion, 'comunicacao')
+
+    def _generate_adaptive_response(self, emotion: str, zdp_level: str, aba_strategy: str) -> str:
+        responses = {
+            'ansiedade': {'inicial': "Vejo que você está preocupado. Vamos respirar fundo juntos?", 'intermediario': "Entendo sua ansiedade. Que tal usarmos uma técnica de relaxamento?", 'avancado': "Reconheço seus sentimentos ansiosos. Vamos desenvolver estratégias de enfrentamento personalizadas?"},
+            'frustacao': {'inicial': "Percebo que você está chateado. Vamos conversar sobre isso?", 'intermediario': "Sua frustração é compreensível. Vamos encontrar uma solução juntos?", 'avancado': "Entendo sua frustração. Vamos analisar a situação e desenvolver estratégias adaptativas?"},
+            'tristeza': {'inicial': "Vejo que você está triste. Estou aqui para ajudar.", 'intermediario': "Entendo que você está se sentindo triste. Vamos conversar sobre o que pode ajudar?", 'avancado': "Percebo sua tristeza. Vamos explorar estratégias de regulação emocional apropriadas?"},
+            'alegria': {'inicial': "Que bom que você está feliz! Conte-me mais.", 'intermediario': "Sua alegria é contagiante! Como podemos manter esse sentimento?", 'avancado': "Maravilhoso saber que você está alegre! Vamos usar essa energia positiva para outras áreas?"},
+            'medo': {'inicial': "Entendo que você tem medo. Vamos enfrentar isso juntos.", 'intermediario': "Seus medos são válidos. Vamos trabalhar estratégias para se sentir mais seguro?", 'avancado': "Compreendo seus medos. Vamos desenvolver um plano gradual de enfrentamento?"},
+            'calma': {'inicial': "Que bom que você está calmo! Vamos aproveitar esse momento.", 'intermediario': "Sua tranquilidade é admirável. Como conseguiu alcançar essa calma?", 'avancado': "Excelente estado de equilíbrio! Vamos consolidar essas estratégias de autorregulação?"}
+        }
+        return responses.get(emotion, {}).get(zdp_level, "Estou aqui para apoiá-lo. Vamos conversar sobre como você está se sentindo?")
+
+class VygotEAAnalyzer:
+    """Analisador de dados e gerador de insights"""
+
+    def __init__(self, interactions_df: pd.DataFrame):
+        self.interactions_df = interactions_df
+
+    def generate_comprehensive_analysis(self):
+        print("=== ANÁLISE ABRANGENTE DOS DADOS DO VYGOTEA ===\n")
+        self._basic_statistics()
+        self._emotion_analysis()
+        self._progress_analysis()
+        self._aba_strategies_analysis()
+        self._satisfaction_analysis()
+        self._create_visualizations()
+
+    def _basic_statistics(self):
+        print("1. ESTATÍSTICAS BÁSICAS")
+        print("-" * 50)
+        print(f"Total de interações: {len(self.interactions_df)}")
+        print(f"Número de perfis de estudantes: {self.interactions_df['student_profile'].nunique()}")
+        print(f"Período de dados: {self.interactions_df['timestamp'].min()} a {self.interactions_df['timestamp'].max()}")
+        print(f"Duração média das interações: {self.interactions_df['duracao_interacao'].mean():.2f} segundos")
+        print(f"Satisfação média: {self.interactions_df['satisfacao_resposta'].mean():.2f}/5.0")
+        print()
+
+    def _emotion_analysis(self):
+        print("2. ANÁLISE DE EMOÇÕES")
+        print("-" * 50)
+        emotion_counts = self.interactions_df['emocao_categoria'].value_counts()
+        print("Distribuição de emoções:")
+        for emotion, count in emotion_counts.items():
+            percentage = (count / len(self.interactions_df)) * 100
+            print(f"  {emotion}: {count} ({percentage:.1f}%)")
+        print("\nEmoções por perfil de estudante:")
+        emotion_profile = pd.crosstab(self.interactions_df['student_profile'], self.interactions_df['emocao_categoria'])
+        print(emotion_profile)
+        print()
+
+    def _progress_analysis(self):
+        print("3. ANÁLISE DE PROGRESSO")
+        print("-" * 50)
+        progress_by_profile = self.interactions_df.groupby('student_profile')['progresso_adaptativo'].agg(['mean', 'std'])
+        print("Progresso médio por perfil:")
+        print(progress_by_profile)
+        correlation = self.interactions_df['progresso_adaptativo'].corr(self.interactions_df['satisfacao_resposta'])
+        print(f"\nCorrelação progresso-satisfação: {correlation:.3f}")
+        print()
+
+    def _aba_strategies_analysis(self):
+        print("4. ANÁLISE DE ESTRATÉGIAS ABA")
+        print("-" * 50)
+        strategy_counts = self.interactions_df['estrategia_aba'].value_counts()
+        print("Estratégias mais utilizadas:")
+        for strategy, count in strategy_counts.head(10).items():
+            percentage = (count / len(self.interactions_df)) * 100
+            print(f"  {strategy}: {count} ({percentage:.1f}%)")
+        strategy_effectiveness = self.interactions_df.groupby('estrategia_aba')['satisfacao_resposta'].mean().sort_values(ascending=False)
+        print("\nEficácia das estratégias (top 5):")
+        for strategy, satisfaction in strategy_effectiveness.head().items():
+            print(f"  {strategy}: {satisfaction:.2f}/5.0")
+        print()
+
+    def _satisfaction_analysis(self):
+        print("5. ANÁLISE DE SATISFAÇÃO")
+        print("-" * 50)
+        satisfaction_by_zdp = self.interactions_df.groupby('nivel_zdp')['satisfacao_resposta'].agg(['mean', 'std'])
+        print("Satisfação por nível ZDP:")
+        print(satisfaction_by_zdp)
+        self.interactions_df['duracao_categoria'] = pd.cut(self.interactions_df['duracao_interacao'], bins=[0, 60, 120, 300], labels=['Curta', 'Média', 'Longa'], right=False)
+        satisfaction_by_duration = self.interactions_df.groupby('duracao_categoria')['satisfacao_resposta'].mean()
+        print("\nSatisfação por duração da interação:")
+        print(satisfaction_by_duration)
+        print()
+
+    def _create_visualizations(self):
+        print("6. GERANDO VISUALIZAÇÕES")
+        print("-" * 50)
+        plt.style.use('seaborn-v0_8')
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+        fig.suptitle('Análise Abrangente do VygotEA', fontsize=16, fontweight='bold')
+        emotion_counts = self.interactions_df['emocao_categoria'].value_counts()
+        axes[0, 0].pie(emotion_counts.values, labels=emotion_counts.index, autopct='%1.1f%%')
+        axes[0, 0].set_title('Distribuição de Emoções')
+        progress_by_profile = self.interactions_df.groupby('student_profile')['progresso_adaptativo'].mean()
+        axes[0, 1].bar(progress_by_profile.index, progress_by_profile.values)
+        axes[0, 1].set_title('Progresso Médio por Perfil')
+        axes[0, 1].set_ylabel('Progresso Adaptativo')
+        axes[0, 1].tick_params(axis='x', rotation=45)
+        satisfaction_by_zdp = self.interactions_df.groupby('nivel_zdp')['satisfacao_resposta'].mean()
+        axes[0, 2].bar(satisfaction_by_zdp.index, satisfaction_by_zdp.values, color='green', alpha=0.7)
+        axes[0, 2].set_title('Satisfação por Nível ZDP')
+        axes[0, 2].set_ylabel('Satisfação Média')
+        axes[1, 0].scatter(self.interactions_df['progresso_adaptativo'], self.interactions_df['satisfacao_resposta'], alpha=0.6)
+        axes[1, 0].set_title('Correlação Progresso-Satisfação')
+        axes[1, 0].set_xlabel('Progresso Adaptativo')
+        axes[1, 0].set_ylabel('Satisfação')
+        strategy_counts = self.interactions_df['estrategia_aba'].value_counts().head(8)
+        axes[1, 1].barh(strategy_counts.index, strategy_counts.values)
+        axes[1, 1].set_title('Estratégias ABA Mais Utilizadas')
+        axes[1, 1].set_xlabel('Frequência')
+        self.interactions_df['data'] = self.interactions_df['timestamp'].dt.date
+        progress_temporal = self.interactions_df.groupby('data')['progresso_adaptativo'].mean()
+        axes[1, 2].plot(progress_temporal.index, progress_temporal.values)
+        axes[1, 2].set_title('Evolução Temporal do Progresso Médio')
+        axes[1, 2].set_xlabel('Data')
+        axes[1, 2].set_ylabel('Progresso Médio')
+        axes[1, 2].tick_params(axis='x', rotation=45)
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.show()
+
+
+# --- Comando para Gerar Tabela de Avaliações do Chatbot VygotEA para 5 Perfis ---
+
+def gerar_tabela_avaliacoes_vygotea_5perfis():
+    """
+    Gera uma tabela de avaliações do chatbot VygotEA com base em dados sintéticos
+    para 5 perfis de adolescentes.
+    Retorna um DataFrame do Pandas e o exibe em formato Markdown e LaTeX.
+    """
+    print("Iniciando geração de dados e treinamento do VygotEA para avaliação de 5 perfis...\n")
+
+    # 1. Gerar a base de dados sintética fixa para reprodutibilidade
+    data_generator = SyntheticDataGenerator()
+    interactions_df = data_generator.generate_fixed_student_interactions(num_interactions=1000)
+
+    # 2. Treinar o classificador de emoções do VygotEA
+    vygot_engine = VygotEAEngine()
+    vygot_engine.train_emotion_classifier(interactions_df)
+
+    # 3. Definir cenários de teste específicos para 5 perfis de adolescentes
+    # Cada perfil terá uma mensagem representativa de suas características
+    test_scenarios_5_profiles = [
+        {
+            'profile_id': 'perfil_1', # Intermediário, ansiedade social, tecnologia
+            'nome_estudante': 'Arthur (15 anos)',
+            'caracteristicas_principais': 'Ansiedade Social, Interesse em Tecnologia',
+            'message': "Estou muito ansioso para o trabalho em grupo de programação, não sei como falar com os outros...!"
+        },
+        {
+            'profile_id': 'perfil_2', # Avançado, perfeccionismo, boa memória
+            'nome_estudante': 'Beatriz (16 anos)',
+            'caracteristicas_principais': 'Perfeccionismo, Dificuldade com Mudanças',
+            'message': "Estou irritada porque mudaram a data da prova e eu já tinha me organizado perfeitamente."
+        },
+        {
+            'profile_id': 'perfil_3', # Inicial, dificuldade expressão, sensibilidade ruído
+            'nome_estudante': 'Carlos (14 anos)',
+            'caracteristicas_principais': 'Dificuldade de Expressão, Sensibilidade a Ruídos',
+            'message': "O barulho no recreio está me incomodando muito, me sinto chateado."
+        },
+        {
+            'profile_id': 'perfil_4', # Avançado, alta funcionalidade, interesse ciências
+            'nome_estudante': 'Diana (17 anos)',
+            'caracteristicas_principais': 'Alta Funcionalidade, Interesse em Ciências',
+            'message': "Estou muito feliz! Meu projeto de ciências foi selecionado para a feira."
+        },
+        {
+            'profile_id': 'perfil_5', # Intermediário, ansiedade performance, rotinas rígidas
+            'nome_estudante': 'Enzo (15 anos)',
+            'caracteristicas_principais': 'Ansiedade de Performance, Rotinas Rígidas',
+            'message': "Tenho que apresentar um trabalho e estou com muito medo de errar na frente de todo mundo."
+        }
+    ]
+
+    # 4. Coletar resultados das interações simuladas
+    evaluation_results = []
+    for i, scenario in enumerate(test_scenarios_5_profiles):
+        student_profile_data = data_generator.student_profiles[scenario['profile_id']]
+        message = scenario['message']
+        response = vygot_engine.generate_response(message, student_profile_data)
+
+        evaluation_results.append({
+            'ID da Interação': f'Int_{i+1}',
+            'Estudante (Perfil)': scenario['nome_estudante'],
+            'Características Principais': scenario['caracteristicas_principais'],
+            'Mensagem do Estudante': message,
+            'Emoção Detectada': response['emotion_detected'].capitalize(),
+            'Confiança (%)': f"{response['confidence']:.2%}",
+            'Nível ZDP': response['zdp_level'].capitalize(),
+            'Estratégia ABA Sugerida': response['aba_strategy'].replace('_', ' ').capitalize(),
+            'Resposta do VygotEA': response['response']
+        })
+
+    # 5. Criar DataFrame com os resultados
+    df_evaluations = pd.DataFrame(evaluation_results)
+
+    print("\n" + "="*120)
+    print("=== Tabela de Avaliações do Chatbot VygotEA com 5 Perfis de Adolescentes (Dados Sintéticos) ===")
+    print("="*120 + "\n")
+
+    # 6. Exibir a tabela em formato Markdown
+    print("Formato Markdown:\n")
+    print(df_evaluations.to_markdown(index=False))
+
+    print("\n" + "="*120)
+
+    # 7. Exibir a tabela em formato LaTeX
+    print("\nFormato LaTeX:\n")
+    df_latex = df_evaluations.copy()
+    for col in df_latex.columns:
+        # Escapar caracteres especiais para LaTeX
+        df_latex[col] = df_latex[col].astype(str).str.replace('_', '\\_').str.replace('%', '\\%').str.replace('&', '\\&')
+        # Limitar o comprimento da string para melhor apresentação em LaTeX (opcional)
+        df_latex[col] = df_latex[col].apply(lambda x: x[:150] + "..." if len(x) > 150 else x)
+
+
+    latex_table = df_latex.to_latex(
+        index=False,
+        caption="Avaliação Qualitativa de Interações do Chatbot VygotEA com Perfis de Adolescentes.",
+        label="tab:vygotea_avaliacoes_adolescentes",
+        # Definir formatos de coluna para controle de largura
+        # p{Xcm} para colunas com quebra de linha automática
+        column_format="l p{2.5cm} p{2.5cm} p{4cm} c c c p{2.5cm} p{5cm}",
+        escape=False # Já tratamos os caracteres especiais
+    )
+
+    # Adicionar \centering para centralizar a tabela no LaTeX
+    latex_table = "\\centering\n" + latex_table
+
+    print(latex_table)
+    print("\n" + "="*120)
+
+    return df_evaluations
+
+# --- Executar o comando para gerar e exibir a tabela ---
+if __name__ == "__main__":
+    tabela_avaliacoes_5p = gerar_tabela_avaliacoes_vygotea_5perfis()
